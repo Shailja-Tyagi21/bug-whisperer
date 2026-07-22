@@ -1,0 +1,65 @@
+{
+  "timestamp": "20260824_134308",
+  "results": {
+    "PayPal redirect issue after checkout": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 27.5
+    },
+    "checkout broken for European customers": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 31.9
+    },
+    "has our refund process had any silent failures?": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 31.5
+    },
+    "how did we fix the memory leak in the worker service?": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 26.9
+    },
+    "what caused the database connection pool issue?": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 25.1
+    },
+    "any performance issues with dashboards or reports loading slowly?": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 27.1
+    },
+    "what MFA or login delivery issues have we seen?": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 25.8
+    },
+    "Are there known issues with the tyre search popup?": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 22.0
+    },
+    "do we have any Bluetooth pairing bugs?": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 18.2
+    },
+    "has billing ever charged customers twice?": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 19.8
+    },
+    "v2.5.0": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 6.5
+    },
+    "v2.6.0": {
+      "passed": true,
+      "quality_errors": [],
+      "elapsed_s": 2.0
+    }
+  }
+}
