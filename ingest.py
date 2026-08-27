@@ -101,7 +101,7 @@ def embed_batch(client: ollama.Client, texts: list, batch_size: int = EMBED_BATC
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ingest bugs into Bug Whisperer")
+    parser = argparse.ArgumentParser(description="Ingest bugs into BugLens")
     parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to bug CSV")
     args = parser.parse_args()
 

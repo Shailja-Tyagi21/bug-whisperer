@@ -21,6 +21,7 @@ from typing import List, Dict, Tuple
 import chromadb
 import ollama
 from dotenv import load_dotenv
+from rank_bm25 import BM25Okapi
 
 # ---- Config ----------------------------------------------------------------
 load_dotenv()
@@ -45,7 +46,11 @@ def _chat_options(temperature: float = 0.0) -> dict:
     return {"temperature": temperature, "seed": LLM_SEED}
 
 # For clickable links in the UI. Change this to your real JIRA base URL.
-JIRA_BASE_URL = "https://your-company.atlassian.net/browse/"
+JIRA_BASE_URL = os.getenv(
+    "JIRA_BASE_URL",
+    os.getenv("JIRA_URL", "https://your-company.atlassian.net").rstrip("/")
+    + "/browse/",
+)
 # ---------------------------------------------------------------------------
 
 
@@ -102,6 +107,41 @@ def list_all_bug_ids() -> set:
     """Every bug ID currently in the collection. Used by the quality checks
     to tell a real citation from a fabricated one."""
     return set(get_collection().get(include=[])["ids"])
+
+
+# ---- BM25 keyword index (hybrid search) -----------------------------------
+# Vector search finds semantically similar bugs but dilutes qualifiers like
+# "European" or "silent" when the dominant topic ("checkout", "failure") has
+# many matches. BM25 scores on exact keyword overlap, which catches precisely
+# the qualifiers that embeddings miss. Merging both gives better ranking
+# without losing semantic breadth.
+
+_bm25_index = None
+_bm25_ids = None
+_bm25_docs = None
+
+# Weight: 0.0 = pure vector, 1.0 = pure keyword. 0.3 means keywords can
+# boost a result but vector similarity still dominates.
+HYBRID_BM25_WEIGHT = float(os.getenv("HYBRID_BM25_WEIGHT", "0.3"))
+
+
+def _tokenize(text: str) -> List[str]:
+    """Simple whitespace + punctuation tokenizer for BM25."""
+    return re.findall(r'\w+', (text or "").lower())
+
+
+def get_bm25_index():
+    """Lazy-build a BM25 index from all documents in the collection."""
+    global _bm25_index, _bm25_ids, _bm25_docs
+    if _bm25_index is None:
+        collection = get_collection()
+        all_data = collection.get(include=["documents"])
+        _bm25_ids = all_data["ids"]
+        _bm25_docs = all_data["documents"]
+        tokenized = [_tokenize(doc) for doc in _bm25_docs]
+        _bm25_index = BM25Okapi(tokenized)
+        print(f"  [hybrid] BM25 index built over {len(_bm25_ids)} documents")
+    return _bm25_index, _bm25_ids, _bm25_docs
 
 
 def embed_query(query: str) -> list:
@@ -287,7 +327,11 @@ def verify_bug_match(query: str, bug: Dict) -> Dict:
         "same feature.\n"
         "- Use 'related' when the bug affects the SAME feature/component/UI element "
         "the user is asking about but describes a DIFFERENT specific issue "
-        "(e.g., styling vs. behavior vs. analytics on the same UI element).\n"
+        "(e.g., styling vs. behavior vs. analytics on the same UI element). "
+        "'related' requires the SAME literal Component value as the bug most "
+        "central to the question — not a different component that merely "
+        "shares a keyword or theme (e.g. 'connection pool' appearing in both "
+        "a Backend bug and an Auth bug does NOT make them related).\n"
         "- Use 'not_relevant' when the bug touches a DIFFERENT feature or scenario, "
         "even if some keywords overlap. Watch for false-friend matches: e.g. a bug "
         "about a 'tyre search popup' is NOT relevant to a question about a 'Save "
@@ -362,33 +406,88 @@ def verify_bug_match(query: str, bug: Dict) -> Dict:
 
 
 def retrieve(query: str, k: int = 5, verify: bool = True) -> List[Dict]:
-    """Return the top-k bugs most semantically similar to the query.
+    """Return the top-k bugs using hybrid search (vector + BM25 keyword).
+
+    How it works:
+    1. Vector search: embed the query, find the k*2 nearest bugs by cosine
+       similarity in ChromaDB (wider net than final k).
+    2. BM25 search: score ALL bugs by keyword overlap with the query.
+    3. Merge: for each candidate, compute a weighted score:
+         final = (1 - BM25_WEIGHT) * vector_score + BM25_WEIGHT * bm25_score
+    4. Re-rank by the merged score and take the top k.
+
+    Why this helps: "checkout broken for European customers" has five
+    payment bugs at similar vector distances (0.62-0.66). BM25 sees
+    "European" in the query, matches "Europe" in BUG-1001's text, and
+    boosts it above the others. Vector search alone couldn't do this
+    because the embedding dilutes qualifier words.
 
     If verify=True, each bug gets an independent verification pass from the LLM,
     checking whether it substantively addresses the same root cause as the query.
-
-    Verification calls run concurrently via a thread pool. IMPORTANT: this only
-    speeds things up if your Ollama server allows more than one in-flight
-    generation. By default OLLAMA_NUM_PARALLEL=1, which serializes requests on
-    the server side regardless of how many the client sends concurrently — set
-    OLLAMA_NUM_PARALLEL=4 (or similar) as an environment variable before
-    `ollama serve` starts to actually get the benefit of this.
     """
+    # --- Step 1: Vector search (wider net) ---
+    vector_k = min(k * 3, 15)  # fetch more candidates for re-ranking
     embedding = embed_query(query)
     space = get_distance_space()
-    results = get_collection().query(query_embeddings=[embedding], n_results=k)
+    results = get_collection().query(query_embeddings=[embedding], n_results=vector_k)
 
-    bugs = []
+    # Build a dict of bug_id -> {document, metadata, vector_similarity}
+    candidates = {}
     for i in range(len(results["ids"][0])):
-        # Convert the raw distance into cosine similarity (0-1, higher =
-        # more similar) using whichever metric the collection was built with.
+        bug_id = results["ids"][0][i]
         distance = results["distances"][0][i]
         similarity = distance_to_similarity(distance, space)
-        bugs.append({
-            "bug_id": results["ids"][0][i],
+        candidates[bug_id] = {
+            "bug_id": bug_id,
             "document": results["documents"][0][i],
             "metadata": results["metadatas"][0][i],
-            "similarity": similarity,
+            "vector_similarity": similarity,
+            "bm25_score": 0.0,
+        }
+
+    # --- Step 2: BM25 keyword scoring ---
+    if HYBRID_BM25_WEIGHT > 0:
+        bm25, bm25_ids, bm25_docs = get_bm25_index()
+        query_tokens = _tokenize(query)
+        bm25_scores = bm25.get_scores(query_tokens)
+
+        # Normalize BM25 scores to 0-1 range
+        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+        for idx, bug_id in enumerate(bm25_ids):
+            if bug_id in candidates:
+                candidates[bug_id]["bm25_score"] = bm25_scores[idx] / max_bm25
+            elif bm25_scores[idx] / max_bm25 > 0.5:
+                # BM25 found a strong keyword match that vector search missed
+                # entirely — pull it from the collection
+                collection = get_collection()
+                result = collection.get(ids=[bug_id], include=["documents", "metadatas"])
+                if result["ids"]:
+                    candidates[bug_id] = {
+                        "bug_id": bug_id,
+                        "document": result["documents"][0],
+                        "metadata": result["metadatas"][0],
+                        "vector_similarity": 0.3,  # low default since vector didn't find it
+                        "bm25_score": bm25_scores[idx] / max_bm25,
+                    }
+
+    # --- Step 3: Merge and re-rank ---
+    w = HYBRID_BM25_WEIGHT
+    for bug in candidates.values():
+        bug["similarity"] = round(
+            (1 - w) * bug["vector_similarity"] + w * bug["bm25_score"],
+            3,
+        )
+
+    ranked = sorted(candidates.values(), key=lambda b: b["similarity"], reverse=True)[:k]
+
+    # Clean up internal fields before returning
+    bugs = []
+    for b in ranked:
+        bugs.append({
+            "bug_id": b["bug_id"],
+            "document": b["document"],
+            "metadata": b["metadata"],
+            "similarity": b["similarity"],
         })
 
     if verify:
@@ -447,7 +546,11 @@ def synthesize(query: str, bugs: List[Dict]) -> str:
                     "must cite that many distinct IDs in the same answer. "
                     "If multiple bugs share a root cause, point that out. "
                     "If the provided bugs don't actually answer the question, say so. "
-                    "Be concise. Lead with the answer."
+                    "ALWAYS explain: what went wrong (root cause), how it was fixed "
+                    "(resolution), and which component was affected. Never give a "
+                    "bare citation like '[BUG-123].' — always write a full sentence "
+                    "explaining the issue. "
+                    "Be concise but complete. Lead with the answer."
                 ),
             },
             {
@@ -501,7 +604,18 @@ def get_bugs_for_release(release_version: str) -> List[Dict]:
 # Priorities that block a release if left open. This is the actual go/no-go
 # rule — deliberately a plain constant + comparison, not an LLM judgment
 # call, so the gate decision itself stays deterministic and auditable.
-BLOCKING_PRIORITIES = {"High", "Blocker"}
+BLOCKING_PRIORITIES = {"High", "Blocker", "Highest"}
+
+# Jira status names that mean "resolved/closed". Different project types
+# use different names: classic projects say "Closed", team-managed projects
+# say "Done", and some workflows have "Resolved" as a separate state.
+# The release gate and the UI both need to treat all of these as "not open".
+CLOSED_STATUSES = {"Closed", "Done", "Resolved"}
+
+
+def _is_open(bug: dict) -> bool:
+    """True if this bug is NOT in a resolved/closed state."""
+    return bug["metadata"].get("status", "").strip() not in CLOSED_STATUSES
 
 
 def _group_by_status(bugs: List[Dict]) -> Dict[str, List[Dict]]:
@@ -571,10 +685,10 @@ def _synthesize_release_recommendation(
         )
 
     if decision == "GO":
-        non_closed = [b for b in all_bugs if b["metadata"].get("status") != "Closed"]
+        non_closed = [b for b in all_bugs if _is_open(b)]
         prompt = (
             f"Release {release_version} has {len(all_bugs)} tracked bug(s) and none are "
-            f"open at High or Blocker priority, so this release is cleared to ship. "
+            f"open at High/Highest/Blocker priority, so this release is cleared to ship. "
             f"Write exactly ONE sentence confirming this release is cleared to ship. "
             f"Do NOT state any bug counts, priorities, or IDs yourself, and do "
             f"NOT sketch or outline what a breakdown would contain — anything of "
@@ -590,8 +704,8 @@ def _synthesize_release_recommendation(
             for status, bugs in status_groups.items()
         )
         prompt = (
-            f"Release {release_version} has {len(blocking_bugs)} open bug(s) at High or "
-            f"Blocker priority, which blocks release per policy. The bugs below are "
+            f"Release {release_version} has {len(blocking_bugs)} open bug(s) at High/Highest/Blocker "
+            f"priority, which blocks release per policy. The bugs below are "
             f"ALREADY grouped by their real status — use these groups exactly as given, "
             f"do not recombine bugs from different status groups into one description "
             f"(e.g. a bug that's still 'Open' has NOT started testing yet, even if "
@@ -676,12 +790,12 @@ def _synthesize_release_recommendation(
         # once swapped "3 low / 4 medium" into "4 low / 3 medium" while also
         # dropping a bug ID, presented with full confidence and nothing on
         # screen to signal it was wrong. Build this list in Python instead.
-        non_closed = [b for b in all_bugs if b["metadata"].get("status") != "Closed"]
+        non_closed = [b for b in all_bugs if _is_open(b)]
         if non_closed:
             by_priority: Dict[str, List[Dict]] = {}
             for b in non_closed:
                 by_priority.setdefault(b["metadata"].get("priority", "Unknown"), []).append(b)
-            priority_order = ["Blocker", "High", "Medium", "Low", "Unknown"]
+            priority_order = ["Blocker", "Highest", "High", "Medium", "Low", "Unknown"]
             parts = []
             for p in priority_order:
                 bugs_p = by_priority.get(p)
@@ -722,7 +836,7 @@ def check_release_readiness(release_version: str) -> Dict:
 
     blocking_bugs = [
         b for b in bugs
-        if b["metadata"].get("status") != "Closed"
+        if _is_open(b)
         and b["metadata"].get("priority") in BLOCKING_PRIORITIES
     ]
     decision = "NO-GO" if blocking_bugs else "GO"
