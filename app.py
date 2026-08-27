@@ -1,7 +1,7 @@
 """
 app.py
 ------
-Streamlit UI for Bug Whisperer.
+Streamlit UI for BugLens.
 
 Run:
     streamlit run app.py
@@ -18,12 +18,12 @@ from search import (
 
 # ---- Page setup ------------------------------------------------------------
 st.set_page_config(
-    page_title="Bug Whisperer",
+    page_title="BugLens",
     page_icon="🐛",
     layout="wide",
 )
 
-st.title("🐛 Bug Whisperer")
+st.title("🔍 BugLens")
 st.caption(
     "Ask anything about historical bugs, or check whether a release is "
     "clear to ship."
@@ -65,11 +65,11 @@ def verification_badge(v: dict) -> str:
     action = v.get("suggested_action", "")
     confidence = v.get("confidence", "?")
     if action == "duplicate":
-        return f"🟢 Same root cause ({confidence})"
+        return f"🟢 Match ({confidence})"
     if action == "related":
-        return f"🟡 Related, not same ({confidence})"
+        return f"🟡 Related ({confidence})"
     if action == "not_relevant":
-        return f"🔴 False positive ({confidence})"
+        return f"🔴 Not relevant ({confidence})"
     return f"⚪ {action} ({confidence})"
 
 
@@ -134,12 +134,10 @@ with search_tab:
                         f"({JIRA_BASE_URL}{b['bug_id']})"
                     )
 
-                    if v:
-                        st.markdown("**Verification**")
+                    if v and v.get("reasoning"):
                         st.markdown(
-                            f"- **Action:** {v.get('suggested_action', '-')}\n"
-                            f"- **Confidence:** {v.get('confidence', '-')}\n"
-                            f"- **Reasoning:** {v.get('reasoning', '-')}"
+                            f"**Verification** ({v.get('confidence', '-')} confidence)"
+                            f"\n\n{v.get('reasoning', '-')}"
                         )
 
                     if meta.get("resolution"):
@@ -172,34 +170,65 @@ with release_tab:
             st.markdown(result["recommendation"])
 
             if result["blocking_bugs"]:
-                st.markdown("### Blocking bugs")
-                for b in result["blocking_bugs"]:
-                    meta = b["metadata"]
-                    with st.expander(
-                        f"[{b['bug_id']}] {meta.get('title', '')} "
-                        f"— {meta.get('priority', '?')} priority — {meta.get('status', '?')}"
-                    ):
-                        st.markdown(f"**Component:** {meta.get('component', '-')}")
-                        st.markdown(f"**Severity:** {meta.get('severity', '-')}")
-                        st.markdown(
-                            f"**JIRA:** [Open {b['bug_id']}]"
-                            f"({JIRA_BASE_URL}{b['bug_id']})"
-                        )
-                        st.code(b["document"])
+                blocking_ids = {b["bug_id"] for b in result["blocking_bugs"]}
+            else:
+                blocking_ids = set()
 
             if result["all_bugs"]:
-                st.markdown(f"### All {len(result['all_bugs'])} bugs tagged with {selected_version}")
-                st.dataframe(
-                    [
-                        {
-                            "ID": b["bug_id"],
-                            "Title": b["metadata"].get("title", ""),
-                            "Component": b["metadata"].get("component", ""),
-                            "Priority": b["metadata"].get("priority", ""),
-                            "Status": b["metadata"].get("status", ""),
-                        }
-                        for b in result["all_bugs"]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                open_bugs = [
+                    b for b in result["all_bugs"]
+                    if b["metadata"].get("status", "").lower()
+                    not in ("done", "closed", "resolved")
+                ]
+                closed_bugs = [
+                    b for b in result["all_bugs"]
+                    if b["metadata"].get("status", "").lower()
+                    in ("done", "closed", "resolved")
+                ]
+
+                if open_bugs:
+                    st.markdown(f"### {len(open_bugs)} open bug(s) in {selected_version}")
+                    st.dataframe(
+                        [
+                            {
+                                "ID": f"{JIRA_BASE_URL}{b['bug_id']}",
+                                "Title": b["metadata"].get("title", ""),
+                                "Component": b["metadata"].get("component", ""),
+                                "Priority": b["metadata"].get("priority", ""),
+                                "Status": b["metadata"].get("status", ""),
+                                "Blocking": "🚫 Yes" if b["bug_id"] in blocking_ids else "",
+                            }
+                            for b in open_bugs
+                        ],
+                        column_config={
+                            "ID": st.column_config.LinkColumn(
+                                "ID",
+                                display_text=r"([A-Z]+-\d+)$",
+                            ),
+                        },
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                if closed_bugs:
+                    with st.expander(f"{len(closed_bugs)} resolved bug(s) in {selected_version}"):
+                        st.dataframe(
+                            [
+                                {
+                                    "ID": f"{JIRA_BASE_URL}{b['bug_id']}",
+                                    "Title": b["metadata"].get("title", ""),
+                                    "Component": b["metadata"].get("component", ""),
+                                    "Priority": b["metadata"].get("priority", ""),
+                                    "Status": b["metadata"].get("status", ""),
+                                }
+                                for b in closed_bugs
+                            ],
+                            column_config={
+                                "ID": st.column_config.LinkColumn(
+                                    "ID",
+                                    display_text=r"([A-Z]+-\d+)$",
+                                ),
+                            },
+                            use_container_width=True,
+                            hide_index=True,
+                        )
