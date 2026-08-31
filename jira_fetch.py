@@ -169,7 +169,6 @@ def issue_to_row(issue: dict) -> dict:
         body = adf_to_text(c.get("body")).strip()
         if body:
             comment_chunks.append(f"{author}: {body}")
-    comments_text = " || ".join(comment_chunks)
 
     # Resolution: prefer the resolution field; if it's just a boilerplate
     # "Done"/"Fixed" label, fall back to the last comment.
@@ -178,7 +177,12 @@ def issue_to_row(issue: dict) -> dict:
     # format: "Comments: <investigation>\n\nResolution: <fix>". When the
     # fallback grabs the whole comment, we need to extract just the
     # Resolution part — otherwise the UI shows both the investigation notes
-    # and the fix under the same "Resolution:" header.
+    # and the fix under the same "Resolution:" header. We also strip that
+    # same "Resolution: ..." text back out of comment_chunks once it's
+    # extracted -- otherwise it survives in BOTH the Comments and Resolution
+    # columns, and ingest.py's build_text_for_embedding() concatenates both
+    # into the embedded document, so the same sentence shows up twice
+    # (visible in the raw-text view as a duplicated Resolution line).
     resolution_name = ""
     res = fields.get("resolution")
     if isinstance(res, dict):
@@ -190,9 +194,21 @@ def issue_to_row(issue: dict) -> dict:
             last_comment = last_comment.split(": ", 1)[1]
         # If the comment has "Resolution:" embedded, extract just that part
         if "Resolution:" in last_comment:
-            resolution_name = last_comment.split("Resolution:", 1)[1].strip()
+            before_resolution, resolution_name = last_comment.split("Resolution:", 1)
+            resolution_name = resolution_name.strip()
+            # Rebuild the last chunk with only the text BEFORE "Resolution:"
+            # so the resolution sentence isn't also left sitting in Comments.
+            last_author = comment_chunks[-1].split(": ", 1)[0]
+            trimmed_before = before_resolution.strip()
+            if trimmed_before:
+                comment_chunks[-1] = f"{last_author}: {trimmed_before}"
+            else:
+                # Nothing left in this comment once Resolution is removed
+                comment_chunks.pop()
         else:
             resolution_name = last_comment
+
+    comments_text = " || ".join(comment_chunks)
 
     # Priority (real Jira field) -- returns as {"name": "High", ...}
     priority = ""
