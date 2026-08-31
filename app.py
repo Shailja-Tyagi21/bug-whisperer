@@ -13,7 +13,7 @@ import streamlit as st
 
 from search import (
     retrieve, synthesize, JIRA_BASE_URL, LLM_MODEL,
-    list_release_versions, check_release_readiness,
+    list_release_versions, check_release_readiness, _is_open,
 )
 
 # ---- Page setup ------------------------------------------------------------
@@ -175,16 +175,14 @@ with release_tab:
                 blocking_ids = set()
 
             if result["all_bugs"]:
-                open_bugs = [
-                    b for b in result["all_bugs"]
-                    if b["metadata"].get("status", "").lower()
-                    not in ("done", "closed", "resolved")
-                ]
-                closed_bugs = [
-                    b for b in result["all_bugs"]
-                    if b["metadata"].get("status", "").lower()
-                    in ("done", "closed", "resolved")
-                ]
+                # Reuse the exact same open/closed rule the go/no-go gate
+                # itself uses (search.py's _is_open / CLOSED_STATUSES) rather
+                # than re-implementing the check here -- two independent
+                # definitions of "open" could silently drift apart (e.g. if
+                # Jira status casing ever varied) and disagree with the
+                # blocking-bug count shown above.
+                open_bugs = [b for b in result["all_bugs"] if _is_open(b)]
+                closed_bugs = [b for b in result["all_bugs"] if not _is_open(b)]
 
                 if open_bugs:
                     st.markdown(f"### {len(open_bugs)} open bug(s) in {selected_version}")

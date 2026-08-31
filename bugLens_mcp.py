@@ -1,5 +1,5 @@
 """
-bugwhisperer_mcp.py
+bugLens_mcp.py
 ---------------------
 MCP (Model Context Protocol) server for BugLens.
 
@@ -19,17 +19,17 @@ SETUP:
     pip install "mcp[cli]"
 
 TEST WITH MCP INSPECTOR:
-    mcp dev bugwhisperer_mcp.py
+    mcp dev bugLens_mcp.py
 
 INSTALL INTO CLAUDE DESKTOP:
-    mcp install bugwhisperer_mcp.py
+    mcp install bugLens_mcp.py
 
 CONFIGURE IN VS CODE (settings.json or .vscode/mcp.json):
     {
       "mcpServers": {
         "buglens": {
           "command": "python3",
-          "args": ["<full-path-to>/bugwhisperer_mcp.py"],
+          "args": ["<full-path-to>/bugLens_mcp.py"],
           "env": {
             "JIRA_URL": "https://hackathon-team-michelin.atlassian.net"
           }

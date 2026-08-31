@@ -2,7 +2,7 @@
   "servers": {
     "buglens": {
       "command": "/Users/shailjatyagi/Desktop/BugWhisperer_hackathon_JIRA/.venv/bin/python3",
-      "args": ["bugwhisperer_mcp.py"],
+      "args": ["bugLens_mcp.py"],
       "env": {
         "JIRA_URL": "https://hackathon-team-michelin.atlassian.net"
       }
