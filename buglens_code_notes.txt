@@ -1,0 +1,1072 @@
+BUGLENS — CODE WALKTHROUGH NOTES
+==================================
+(Compiled while studying the codebase file-by-file for hackathon presentation prep)
+
+
+================================================================================
+FILE 1: jira_fetch.py
+================================================================================
+
+PURPOSE
+-------
+Pulls bugs from Jira Cloud via its REST API and writes them into a CSV file
+that ingest.py can consume. This is the bridge between "real Jira data" and
+"the local vector search system."
+
+WHEN IT RUNS
+------------
+Once, manually, as a setup step. Never runs automatically or as part of a
+live query.
+
+COMMAND
+-------
+python3 jira_fetch.py
+    → produces jira_bugs.csv
+
+CONFIG (read from .env)
+------------------------
+- JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN  — login credentials
+- JIRA_JQL                              — which bugs to fetch (default: all
+                                           Bug-type issues, newest first)
+- MAX_BUGS (default 500)                — safety cap so a bad query can't
+                                           pull everything
+- FIELD_ID_BUG_COMPONENT   = customfield_10076   (HARDCODED)
+- FIELD_ID_RELEASE_VERSION = customfield_10077   (HARDCODED)
+- FIELD_ID_SEVERITY        = customfield_10078   (HARDCODED)
+  → hardcoded because this Jira project (team-managed) has no native
+    Component/Severity/Fix-Version fields; three custom dropdowns were
+    created instead. Jira's API refers to custom fields by these opaque
+    IDs, not by display name. Found originally via list_jira_fields.py
+    (GET /rest/api/3/field, filtered by name).
+- PAGE_SIZE = 50   — Jira's own cap per API response
+- REQUEST_TIMEOUT = 30 seconds
+
+KEY FUNCTIONS (in order of use)
+---------------------------------
+
+1. fetch_page(auth, next_page_token=None) -> dict
+   - Makes ONE HTTP POST request to /rest/api/3/search/jql
+   - Explicitly lists field names to fetch, INCLUDING the 3 custom field
+     IDs — Jira does NOT return custom fields unless you name them.
+   - Takes an optional next_page_token (Jira's "continue from here" marker)
+   - response.raise_for_status() crashes cleanly on HTTP errors
+   - Returns the parsed JSON response
+
+2. adf_to_text(node) -> str
+   - Jira stores descriptions/comments as ADF (Atlassian Document Format)
+     — a nested JSON tree, not plain text (like a mini HTML DOM).
+   - RECURSIVE function: flattens that tree into plain text.
+   - Handles node types: text, paragraph, heading, blockquote, bulletList,
+     orderedList, listItem, codeBlock, mention, hardBreak, rule.
+   - Falls back to recursing into unknown node types rather than crashing.
+   - Needed because the embedding model only understands plain text.
+
+3. _option_value(field_value) -> str
+   - Custom dropdown fields come back as {"value": "Payments", "id": "..."}
+     — not as a plain string.
+   - Extracts just the "value" text; returns "" if field is None/empty/
+     unexpected shape.
+   - Used for all 3 custom fields (Component, ReleaseVersion, Severity).
+
+4. issue_to_row(issue) -> dict
+   - THE CORE CONVERTER. Takes one raw Jira issue JSON and flattens it
+     into ONE dictionary with exactly the 11 CSV columns needed:
+     ID, Title, Description, Comments, Resolution, Component, Severity,
+     Priority, Status, Created, ReleaseVersion.
+   - Comments: joins all comments as "Author: text" chunks, separated by
+     " || " (a delimiter unlikely to appear naturally in real text).
+   - RESOLUTION FALLBACK LOGIC (important, asked about twice; FIXED once
+     more since — see below):
+       a. Prefer Jira's built-in Resolution field.
+       b. But that field is usually just a generic label ("Done", "Fixed",
+          "Resolved") — not a real explanation of the fix.
+       c. If it's empty or one of those generic labels, fall back to the
+          LAST COMMENT on the ticket instead (people usually explain the
+          actual fix in comments, not the Resolution field).
+       d. SPECIAL CASE: upload_bugs_to_jira.py (the script that created
+          the test bugs) wrote comments in the format:
+              "Comments: <investigation>\n\nResolution: <fix>"
+          If the fallback comment contains the literal string
+          "Resolution:", split on it and keep ONLY the text after it as
+          resolution_name.
+       e. If "Resolution:" is NOT found in the comment, use the whole
+          comment as-is (nothing to split).
+
+     REAL BUG FOUND AND FIXED (post-Jira-integration): the original
+     version only did step (d)'s split to PULL OUT the resolution text —
+     it never removed that same text from comment_chunks afterward. So
+     the full original comment (investigation + resolution together)
+     stayed in Comments, WHILE a second copy of just the resolution
+     sentence also got extracted into the Resolution column. Since
+     ingest.py's build_text_for_embedding() concatenates Comments AND
+     Resolution into one document, the resolution sentence appeared
+     TWICE in the embedded text (visible in the app's "show raw text"
+     view as a duplicated line).
+     THE FIX: after splitting on "Resolution:", the code now ALSO
+     rewrites comment_chunks[-1] to keep only the part BEFORE
+     "Resolution:" (reattaching the original author name) — or, if
+     nothing meaningful remains after removing it, drops that comment
+     entry entirely with .pop(). comments_text = " || ".join(comment_chunks)
+     now runs AFTER this whole block (moved later in the function),
+     since comment_chunks itself gets mutated by the fix and the join
+     must happen only once that's settled.
+
+5. main()
+   - Checks credentials exist; sys.exit() with a helpful message if not.
+   - PAGINATION LOOP (while True):
+       - Calls fetch_page() each iteration.
+       - Converts every returned issue via issue_to_row(), appends to rows.
+       - TWO INDEPENDENT STOP CONDITIONS (whichever comes first):
+           1. len(rows) >= MAX_BUGS           → hit safety cap, break
+           2. next_page_token comes back empty → Jira has no more pages,
+              break (this is the NORMAL way the loop ends)
+       - next_page_token starts as None (first request = "give me page 1,
+         no continuation point yet"); later, None means "Jira confirms
+         there's nothing left."
+   - Writes all rows to CSV via csv.DictWriter (quoting=QUOTE_ALL protects
+     against commas/newlines inside bug text corrupting the file structure).
+   - SANITY CHECK: for each of the 3 custom fields, counts how many of the
+     N rows have that field non-empty.
+       - If filled == 0 (ZERO across ALL rows) → prints a warning that the
+         custom field ID may have changed / drifted, suggests re-running
+         list_jira_fields.py. (A systemic break, not just some bugs
+         missing a value.)
+       - Otherwise prints "X/N rows populated" as a quick health check.
+   - Prints the next command to run: python3 ingest.py --csv jira_bugs.csv
+
+OUTPUT
+------
+jira_bugs.csv — same column structure as sample_bugs.csv, so nothing
+downstream (ingest.py, search.py, app.py, quality_checks.py) needs to
+change based on whether data came from real Jira or hand-written test data.
+
+TWO THINGS WORTH REMEMBERING FOR THE INTERVIEW
+------------------------------------------------
+1. The Resolution fallback chain (field → last comment → strip out
+   embedded "Resolution:" marker) — shows handling of messy real-world
+   data with graceful degradation at each step.
+2. Pagination has two INDEPENDENT stop conditions checked every loop
+   iteration — a safety cap AND a natural "no more data" signal from the
+   API — not just one.
+
+POSSIBLE INTERVIEW QUESTION: "What if you had multiple Jira projects/
+modules?"
+- Current: single hardcoded JQL, single CSV, single ChromaDB collection.
+- Extension: broaden JQL to pull ALL projects in one fetch (no project
+  filter), add a "project" column during ingest, then let the Streamlit
+  UI expose a dropdown that filters searches by project using ChromaDB's
+  metadata `where` clause — at QUERY TIME, not by re-fetching/re-ingesting.
+  ingest.py and jira_fetch.py run once regardless of how many projects;
+  the dropdown only narrows what's already stored.
+
+
+================================================================================
+FILE 2: ingest.py
+================================================================================
+
+PURPOSE
+-------
+One-time (or re-runnable) ingestion of bug history into a local ChromaDB
+vector store. Reads a CSV, embeds the meaningful text fields via a local
+Ollama embedding model (nomic-embed-text, 768-dim), persists to disk.
+
+WHEN IT RUNS
+------------
+Once, manually, after jira_fetch.py (or standalone against sample_bugs.csv).
+Must be RE-RUN any time the embedding model or distance metric changes, or
+whenever new/updated bug data needs to be reflected in search.
+
+COMMAND
+-------
+python3 ingest.py
+python3 ingest.py --csv jira_bugs.csv
+
+CONFIG
+------
+- EMBEDDING_MODEL = "nomic-embed-text"   — HARDCODED, not in .env.
+  WHY: this isn't a personal setting like a URL/token — it's a structural
+  contract with the data already on disk. The embedding model determines
+  the VECTOR DIMENSION (768 numbers per bug, in this case). All vectors in
+  chroma_db/ were built with this exact model. If a query used a different
+  model, it would produce vectors of a different length, which can't be
+  meaningfully compared to the stored ones — similarity search would break
+  or crash. Putting this in .env would make it dangerously easy to change
+  independently without realizing you also need to rebuild the whole DB.
+- OLLAMA_HOST — from .env, default localhost:11434
+- CHROMA_DIR = "./chroma_db"     — where the vector DB is saved on disk
+- COLLECTION_NAME = "bugs"        — ChromaDB can hold multiple named
+                                    collections; this project uses one
+- DEFAULT_CSV = "sample_bugs.csv" — fallback if no --csv flag given
+- EMBED_BATCH_SIZE = 50           — send bugs to Ollama in chunks of 50
+                                    rather than all at once (memory/latency)
+
+KEY PATTERN: lazy singleton (get_ollama_client)
+-------------------------------------------------
+_ollama_client = None   (module-level, starts empty)
+
+def get_ollama_client():
+    global _ollama_client
+    if _ollama_client is None:
+        _ollama_client = ollama.Client(host=OLLAMA_HOST)
+    return _ollama_client
+
+- "Singleton" = only ONE shared connection object for the whole script,
+  instead of creating a fresh one every time it's needed (wasteful).
+- "Lazy" = don't create it immediately at file-load time; wait until the
+  FIRST actual call needs it.
+- `global` keyword is essential: without it, writing to _ollama_client
+  inside the function would create a throwaway LOCAL variable, forgotten
+  the moment the function returns — every call would create a new client
+  again, defeating the whole point.
+- First call: _ollama_client is None → creates + stores a real client.
+- Every call after: _ollama_client is already set → skips creation,
+  returns the same cached object.
+- SAME pattern also used in search.py for get_bm25_index() and
+  get_collection().
+
+KEY FUNCTIONS
+--------------
+
+1. build_text_for_embedding(row) -> str
+   - THE MOST IMPORTANT FUNCTION for retrieval quality — decides exactly
+     what text gets turned into a vector for each bug.
+   - Always includes: Title, Component, Description (every bug has these).
+   - CONDITIONALLY includes Comments and Resolution, only if they're both:
+       (a) not pandas' NaN marker (pd.notna check) — a CSV cell can be
+           truly blank, which pandas represents as NaN, not empty string
+       (b) not just whitespace after stripping (str(...).strip() check)
+   - Both checks needed because a cell can be "empty" in two different
+     ways: genuinely missing (NaN) vs. present-but-blank (just spaces).
+   - Final text = all included parts joined with newlines, e.g.:
+       "Title: PayPal redirect returns to wrong page after checkout
+        Component: Payments
+        Description: After completing PayPal checkout...
+        Comments: Root cause: return_url was set to '/'...
+        Resolution: Fixed env var PAYPAL_RETURN_URL..."
+   - This ENTIRE STRING (no truncation, no length cap) is what gets sent
+     to nomic-embed-text and turned into the 768-number vector.
+   - IMPORTANT: Comments/Resolution here are NOT truncated — full text
+     always gets embedded, regardless of length. Truncation (see below)
+     only affects the separately-stored DISPLAY metadata, not the search
+     vector itself.
+
+2. build_metadata(row) -> dict
+   - DIFFERENT PURPOSE from build_text_for_embedding(): this data is
+     stored ALONGSIDE the vector but never embedded/compared for
+     similarity — it's purely for DISPLAY and FILTERING later (e.g.
+     showing "Status: Done" on a card, or the release-readiness gate
+     checking status/priority).
+   - Every field forced to str(...) for consistent typing downstream.
+   - resolution = "" if pd.isna(resolution) else str(resolution)
+       - A conditional expression (one-line if/else). Unfolded:
+             if pd.isna(resolution):
+                 resolution = ""
+             else:
+                 resolution = str(resolution)
+       - WHY NEEDED: without this, a genuinely blank cell (pandas NaN)
+         would get converted by a bare str(NaN) into the literal STRING
+         "nan" — a real, confusing bug if not explicitly guarded against.
+   - "resolution": resolution[:500]  — truncates to first 500 characters.
+       - [:500] is Python slice syntax: "everything from start up to
+         (not including) index 500."
+       - WHY RESOLUTION CAN BE LONG: in jira_fetch.py, when Jira's real
+         Resolution field is just a generic label ("Done"), the code
+         substitutes the LAST COMMENT on the ticket instead — and
+         comments can be several paragraphs long. So "Resolution" here
+         isn't always a short label; it can effectively BE a long comment.
+       - NOTE: jira_fetch.py ALREADY caps its own fallback comment at
+         500 chars before writing the CSV. ingest.py caps AGAIN here.
+         This is likely defensive redundancy (protects against CSVs that
+         didn't go through jira_fetch.py, e.g. hand-written sample data)
+         rather than a deliberate double-check — minor technical debt,
+         not a bug.
+       - RISK IDENTIFIED: truncation is a dumb character-count cutoff —
+         no awareness of sentence/word boundaries. COULD chop the actual
+         root cause mid-sentence if it happened to fall after character
+         500.
+       - BUT: this ONLY affects the metadata dictionary used for DISPLAY.
+         build_text_for_embedding() (above) has NO truncation — the full
+         text always gets embedded and searched, so search quality/
+         synthesis is unaffected even if the DISPLAYED "Resolution:" field
+         in the UI gets cut short. Confirmed via live check: actual
+         resolutions in this project's data are ~100 characters, well
+         under the cap, ending in complete sentences — the truncation
+         risk is theoretical for this dataset, not actually triggered.
+
+WHERE build_metadata()'S OUTPUT GETS USED LATER (important — write once,
+read many times)
+--------------------------------------------------------------------------
+- search.py's retrieve(): results["metadatas"][0][i] IS exactly this
+  dictionary, read back out of ChromaDB unchanged.
+- app.py: meta.get('component'), meta.get('severity'), meta.get('status')
+  — used to render the Source Bug cards.
+- app.py's release readiness tab: b["metadata"].get("status", "").lower()
+  not in ("done", "closed", "resolved") — the exact status-checking logic
+  that determines the GO/NO-GO gate.
+- Written ONCE per bug at ingest time; read MANY times afterward by every
+  search and every release check, forever, until the next re-ingest.
+
+3. embed_batch(client, texts, batch_size=50) -> list
+   - Sends texts to Ollama in CHUNKS rather than all at once (memory/
+     latency safety for local hardware).
+   - for i in range(0, len(texts), batch_size):
+       - Generates 0, 50, 100, ... — start index of each chunk.
+       - With 60 texts and batch_size=50: runs twice (i=0, i=50).
+   - batch = texts[i:i+batch_size]  — slice syntax grabs one chunk.
+       - First iteration: texts[0:50] (50 items)
+       - Second iteration: texts[50:100] → only 10 exist, Python just
+         gives what's there: texts[50:60] (10 items), no error.
+   - client.embed(model=EMBEDDING_MODEL, input=batch) — ONE network call
+     per batch, sends the whole chunk, gets back one vector per text.
+   - Wrapped in try/except ollama.ResponseError — fails fast with a clear
+     "is ollama serve running / did you pull the model" message rather
+     than a confusing raw stack trace.
+   - all_embeddings.extend(response.embeddings) — see APPEND VS EXTEND
+     note below. Ends with ONE FLAT list of 60 vectors total, in the same
+     order as the original 60 input texts, regardless of how many batches
+     it took to get there.
+
+   APPEND VS EXTEND (small but important Python distinction):
+   -----------------------------------------------------------
+   my_list = [1, 2, 3]
+   new_items = [4, 5, 6]
+
+   my_list.append(new_items)  → [1, 2, 3, [4, 5, 6]]     (nested — WRONG
+                                                            shape for this use)
+   my_list.extend(new_items)  → [1, 2, 3, 4, 5, 6]        (flat — what we want)
+
+   response.embeddings for one batch of 3 texts looks like:
+       [[v1_768_numbers], [v2_768_numbers], [v3_768_numbers]]
+   .extend() unpacks that and adds each vector individually into
+   all_embeddings, so after 2 batches you get ONE flat list of 60 vectors
+   — not a list of 2 batches. This exact flat shape is what
+   collection.add(embeddings=...) expects later.
+
+4. main() — orchestrates everything in 4 numbered steps
+   ------------------------------------------------------
+   [1/4] Load + validate CSV
+      - argparse lets you run `python3 ingest.py --csv jira_bugs.csv`;
+        falls back to DEFAULT_CSV if no flag given.
+      - Path(args.csv).exists() check — fail fast if file doesn't exist.
+      - pd.read_csv() loads the whole CSV into a DataFrame (df).
+      - COLUMN VALIDATION via set subtraction:
+            required = {"ID", "Title", "Description"}
+            missing = required - set(df.columns)
+        Set subtraction = "everything in the LEFT set that is NOT in the
+        RIGHT set." If every required column exists in the CSV, nothing
+        is "left over" → missing = empty set() → `if missing:` is False
+        (empty set is falsy in Python) → continue normally.
+        If e.g. "Description" got deleted from the CSV, it survives the
+        subtraction → missing = {"Description"} → `if missing:` is True
+        → sys.exit() with the exact missing column name(s).
+
+   [2/4] Ollama health check
+      - get_ollama_client() — the lazy singleton, described above.
+      - ollama_client.list() — a CHEAP ping (just "what models do you
+        have?"), used purely to test connectivity BEFORE committing to
+        expensive embedding work.
+      - WHY CHECK HERE, SEPARATELY: if this check didn't exist, you'd
+        only discover Ollama wasn't running deep inside embed_batch(),
+        after already doing all the CSV loading/validation for nothing.
+        Fails fast at step 2 of 4 instead of failing confusingly later.
+
+   [3/4] Build texts + embeddings + metadata + ids
+      - texts = [build_text_for_embedding(row) for _, row in df.iterrows()]
+        LIST COMPREHENSION: compact loop building a new list.
+        df.iterrows() yields (index, row) pairs; `_` means "ignore the
+        index, I only want the row." Runs build_text_for_embedding() on
+        every row, collects all 60 results into one list.
+      - embeddings = embed_batch(ollama_client, texts) — the function
+        above, turning all 60 texts into 60 vectors.
+      - metadatas = [build_metadata(row) for _, row in df.iterrows()]
+        Same list-comprehension pattern, using build_metadata() instead.
+      - ids = [str(row["ID"]) for _, row in df.iterrows()]
+        Same pattern, just pulling the ID column.
+      - NOTE: df.iterrows() gets called 3 SEPARATE times (once per list
+        comprehension) rather than once — mildly inefficient (loops
+        through the same 60 rows three times) but irrelevant at this
+        scale, and keeps each piece of logic clean/separate.
+
+   [4/4] Write to ChromaDB
+      - chromadb.PersistentClient(path=CHROMA_DIR) — "persistent" means
+        saved to disk (the ./chroma_db folder), not just kept in memory
+        and lost when the script ends.
+      - delete_collection() wrapped in try/except Exception: pass — makes
+        this script SAFELY RE-RUNNABLE. Deletes any old "bugs" collection
+        first so re-running doesn't pile up duplicate/stale data. The
+        try/except specifically handles "nothing exists yet to delete"
+        (e.g. very first run) without treating that as an error.
+      - create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+        TWO DIFFERENT "METADATA" CONCEPTS — don't confuse them:
+          (a) PER-BUG metadata (build_metadata() output) — one small dict
+              PER BUG describing status/priority/etc. 60 of these.
+          (b) COLLECTION-level metadata (this line) — ONE dict for the
+              WHOLE collection, describing how it should behave overall.
+        "hnsw:space": "cosine" — an internal ChromaDB setting controlling
+        which distance-measuring FORMULA to use for every vector
+        comparison in this collection. THIS IS THE FIX for a real past
+        bug in this project: leaving this out makes ChromaDB silently
+        default to "l2" instead — no error, searches still "work," but
+        every similarity threshold in search.py (tuned for cosine-style
+        numbers) quietly starts meaning something different. Pinning it
+        explicitly here means search.py's get_distance_space() always
+        reads back the correct value and applies the right conversion.
+      - collection.add(embeddings=, documents=, metadatas=, ids=) — the
+        actual write. FOUR PARALLEL LISTS, each 60 items long, all lined
+        up by POSITION (index 0 across all four = the same bug). Each of
+        the four serves a DIFFERENT purpose for the SAME bug:
+            embeddings → the 768-number vector (math/comparison only,
+                          not human-readable)
+            documents  → the original readable text (for display AND for
+                          the LLM to read during synthesis)
+            metadatas  → small structured facts (status/priority/etc,
+                          for filtering and quick display)
+            ids        → the bug ID string, ties all of the above together
+        None of these four are duplicates of each other — they're four
+        DIFFERENT pieces of information about the SAME bug, all needed
+        for different reasons downstream.
+      - Final print statements confirm bug count and embedding dimension
+        (len(embeddings[0]) — length of just the FIRST vector — confirms
+        it's actually 768, a quick sanity check).
+
+   if __name__ == "__main__": main()
+      - Standard Python idiom: only run main() if this file is executed
+        directly (`python3 ingest.py`), not if some other file imports
+        functions from it.
+
+KNOWN MINOR ISSUE IDENTIFIED WHILE STUDYING (worth mentioning if asked)
+--------------------------------------------------------------------------
+The 500-character truncation on the "resolution" metadata field is a
+character-count cutoff with NO awareness of sentence boundaries — it
+could theoretically chop the actual root cause mid-sentence if a long
+resolution/comment happened to cross the 500-char mark. HOWEVER:
+  - This ONLY affects the DISPLAYED metadata field in the UI.
+  - build_text_for_embedding() has NO truncation — the FULL, complete
+    text always gets embedded and searched, so search quality/synthesis
+    is unaffected regardless of length.
+  - Live-checked on this actual dataset: real resolutions run ~100
+    characters, well under the cap, ending in complete sentences — the
+    truncation risk is theoretical here, not actually triggered.
+  - Minor additional redundancy: jira_fetch.py ALSO caps its own fallback
+    comment at 500 chars before writing the CSV, so ingest.py's cap here
+    is a second, likely-defensive layer (protects against non-Jira-
+    sourced CSVs like sample_bugs.csv) rather than a deliberate double-
+    check — normal minor technical debt, not a functional bug.
+
+QUICK SUMMARY — ingest.py
+--------------------------
+- Purpose: one-time setup script that reads a bug CSV and builds the
+  local vector database (chroma_db/) everything else searches against.
+- Command: python3 ingest.py --csv jira_bugs.csv
+- For each bug, builds THREE separate things that get stored together:
+    1. An embedding (768-number vector) — for math/similarity comparison
+    2. The original text — for display and for the LLM to read
+    3. A metadata dict (status, priority, component...) — for filtering
+       and quick display, e.g. the release-readiness GO/NO-GO check
+- EMBEDDING_MODEL is hardcoded (not in .env) because changing it requires
+  rebuilding the whole database — it's a structural contract, not a
+  personal setting.
+- Runs in 4 steps: load+validate CSV → health-check Ollama → build texts/
+  embeddings/metadata/ids → delete old collection and write the new one.
+- Deletes and recreates the ChromaDB collection every run, so it's safely
+  re-runnable any time the source data changes.
+- Explicitly pins the distance metric to "cosine" at creation time — this
+  was the fix for a real past bug where the metric silently defaulted to
+  "l2," quietly breaking every similarity threshold in search.py.
+- Resolution text gets truncated to 500 characters in the DISPLAY
+  metadata only — the full text is always used for the actual embedding/
+  search, so truncation never affects answer quality.
+
+
+================================================================================
+FILE 3: search.py
+================================================================================
+
+PURPOSE
+-------
+Core retrieval + verification + synthesis engine. Embeds the user's
+question, does HYBRID search (vector + BM25 keyword) against ChromaDB,
+independently verifies each candidate bug with a separate AI call, then
+asks the AI to write a final answer grounded ONLY in verified-relevant
+bugs. Also contains the deterministic release readiness (GO/NO-GO) logic.
+
+NEVER RUN DIRECTLY IN PRODUCTION — imported as a library by app.py and
+bugwhisperer_mcp.py. Can be run standalone for quick terminal testing:
+    python3 search.py "some question"
+
+CONFIG
+------
+- EMBEDDING_MODEL = "nomic-embed-text" — HARDCODED, must match ingest.py
+  exactly (same reasoning as ingest.py: changing it independently breaks
+  vector comparison since dimensions wouldn't match).
+- LLM_MODEL — from .env (default "llama3.1"). SAFE to change independently
+  — unlike the embedding model, which model writes/reads answers doesn't
+  affect the stored vectors at all.
+- OLLAMA_HOST, CHROMA_DIR, COLLECTION_NAME — must match ingest.py, same
+  database.
+- LLM_SEED = 42 (from .env, default) — fixes an underlying randomness
+  source in the AI model so identical queries give identical answers
+  across runs. WHY NEEDED EVEN WITH temperature=0: temperature controls
+  word-choice randomness ("always pick the top choice" at 0), but tiny
+  floating-point/hardware-level noise can still occasionally flip a
+  borderline decision (e.g. "related" vs "not_relevant") even at
+  temperature 0. The seed locks down that remaining randomness too.
+  The number 42 itself has NO special meaning — any fixed number works
+  identically; it's a common programming convention/injoke.
+- _chat_options(temperature) — tiny helper centralizing {temperature, seed}
+  for every LLM call in this file, so the seed is never accidentally
+  forgotten at a call site. temperature=0.0 used for verification (want
+  consistency), temperature=0.2 used for synthesis (small natural
+  variation in final answer phrasing is fine).
+- JIRA_BASE_URL — built from JIRA_URL (falls back to a placeholder if
+  unset), used to build clickable Jira links like .../browse/SCRUM-9.
+
+LAZY SINGLETON PATTERN (used 3 times in this file)
+-----------------------------------------------------
+_ollama_client = None / _collection = None / _bm25_index = None (+ ids/docs)
+- Module-level variables starting empty; only built on first actual use.
+- `global` keyword required inside the getter function — without it,
+  Python would create a throwaway LOCAL variable instead of modifying the
+  module-level one, and every call would rebuild from scratch.
+- get_collection() vs ingest.py's create_collection(): search.py only
+  ever READS an existing collection (get_collection), never creates/
+  deletes one — it assumes ingest.py has already run.
+- WHY LAZY: importing search.py (e.g. `from search import retrieve` in
+  app.py) should be instant — connecting to Ollama/opening the DB only
+  happens the first time it's actually needed, not just from importing.
+
+DISTANCE / SIMILARITY CONVERSION
+-----------------------------------
+- get_distance_space() reads back the "hnsw:space" setting ingest.py
+  pinned at collection-creation time (should return "cosine" for this
+  project — confirmed via python3 -c "from search import
+  get_distance_space; print(get_distance_space())").
+- distance_to_similarity(distance, space) — converts ChromaDB's raw
+  distance number into a clean 0-1 similarity score, using a DIFFERENT
+  formula depending on which metric the collection uses (cosine/l2/ip —
+  these three metrics measure "distance" completely differently, so one
+  formula does NOT work for all three).
+- Final line max(0.0, min(1.0, sim)) — a CLAMP. Floating-point rounding
+  can occasionally produce a similarity like 1.0000003 or -0.0000004;
+  this forces the result to always stay cleanly within [0.0, 1.0].
+
+list_all_bug_ids() -> set
+- Fetches every bug ID in the collection (include=[] skips
+  documents/embeddings/metadata for speed — only IDs needed).
+- Returned as a SET (not list) for fast "is this ID real?" membership
+  checks — used by quality_checks.py to catch fabricated citations.
+
+HYBRID SEARCH (BM25 + vector) — THE MOST IMPORTANT DESIGN DECISION HERE
+--------------------------------------------------------------------------
+WHY IT EXISTS: vector search alone dilutes specific qualifier words (like
+"European") when surrounded by common words ("checkout", "customers") —
+because the whole sentence gets squashed into ONE 768-number vector.
+CONFIRMED LIVE: for "checkout broken for European customers," pure vector
+search ranked the correct bug (SCRUM-8, Visa cards issued in Europe) at
+POSITION 5 (similarity 0.619) — behind 4 unrelated payment bugs. After
+adding BM25, SCRUM-8 moved to POSITION 1 (0.733).
+
+- BM25 = a classic (1990s) keyword-matching algorithm — scores documents
+  by how many QUERY WORDS they contain, weighted by how RARE each word is
+  across the whole corpus. A rare word like "European" matters much more
+  than a common word like "checkout" that appears in 15+ bugs.
+- _tokenize(text): lowercases + splits text into a list of plain words
+  via regex \w+ (throws away punctuation). "European!" -> "european".
+- get_bm25_index(): lazy-built ONCE, fetches ALL 60 documents (not just
+  top-k — BM25 needs to see the WHOLE corpus at once to know word rarity,
+  unlike vector embeddings which are computed independently per-document).
+  Hands all 60 tokenized documents to BM25Okapi() from rank_bm25 library.
+- HYBRID_BM25_WEIGHT = 0.3 (from .env) — the blend ratio: final_score =
+  0.7 * vector_similarity + 0.3 * bm25_score. Vector dominates, keyword
+  matching gives a meaningful boost.
+
+RETRIEVE() — FULL TRACE (the core search function)
+-----------------------------------------------------
+STEP 1 — vector_k = min(k*3, 15): fetch a WIDER net (15, not just final 5)
+  so BM25 has room to promote a bug vector search ranked lower.
+STEP 2 — embed_query() turns the question into a 768-number vector;
+  get_collection().query(...) asks ChromaDB for the 15 closest matches.
+  Internally: ChromaDB compares your query's position in 768-dimensional
+  space against all 60 stored bug positions, measuring "distance" using
+  whichever metric (cosine) the collection was built with, and returns
+  the 15 nearest ones with their id/distance/document/metadata (never
+  raw vector numbers — those aren't meaningful to look at directly).
+STEP 3 — build `candidates` dict: one entry per of the 15 vector results,
+  converting each raw distance to a 0-1 similarity, storing document +
+  metadata, with bm25_score starting as a 0.0 placeholder.
+STEP 4 — BM25 scores ALL 60 bugs (not just the 15). Normalize by dividing
+  by the single highest score found (max_bm25) so everything lands in
+  0-1 range (protects against divide-by-zero if every score is 0).
+  Loop over all 60 BM25 results:
+    - if bug_id already in candidates (one of the 15): UPDATE its
+      bm25_score with the real normalized value.
+    - elif NOT in candidates but bm25_score > 0.5 (BM25 found a genuinely
+      strong keyword match vector search never even considered): FETCH
+      that bug fresh from ChromaDB and ADD it to candidates as a new
+      entry, with a LOW placeholder vector_similarity=0.3 (since vector
+      search never found it, there's no real vector score to use) but its
+      real bm25_score.
+    CONFIRMED LIVE: for "checkout broken for European customers," this
+    rescue mechanism pulled in SCRUM-37 (an UNRELATED autocomplete-lag
+    bug) purely on keyword overlap — bm25_score=0.622, meeting the >0.5
+    threshold despite being topically irrelevant. This proves the rescue
+    is INTENTIONALLY generous/trigger-happy: its job is only to make sure
+    nothing POTENTIALLY relevant is silently excluded, not to make a
+    final correctness judgment.
+STEP 5 — merge: for every candidate (could be 16+ after rescues), compute
+  final blended similarity = 0.7*vector_similarity + 0.3*bm25_score
+  (rounded to 3 decimals). sorted(...)[:k] — THIS is the exact moment the
+  candidate count narrows from "many" down to exactly k=5 — everything
+  after this point in the function preserves that same count of 5.
+    CONFIRMED LIVE: SCRUM-37's blended score (~0.397, dragged down by its
+    low 0.3 vector placeholder) did NOT survive this cut — it lost to 5
+    other bugs scoring 0.569-0.751, proving the rescue mechanism's false
+    positives get filtered out by ranking, even before verification runs.
+STEP 6 — cleanup loop: strip out the now-unneeded internal fields
+  (vector_similarity, bm25_score), keeping only bug_id/document/
+  metadata/similarity for the final 5.
+STEP 7 — verification (if verify=True, default):
+    with ThreadPoolExecutor(max_workers=min(len(bugs), 5)) as executor:
+        verifications = list(executor.map(lambda b: verify_bug_match(query, b), bugs))
+  CONCURRENCY: instead of calling the AI 5 times one after another
+  (5 x wait time), fires multiple calls at roughly the SAME time via a
+  thread pool — total wait is closer to 1x wait time, not 5x. (Phone-call
+  analogy: calling 5 people sequentially at 5 min each = 25 min total;
+  calling all 5 "simultaneously" and waiting for the slowest = ~5 min.)
+  `lambda b: verify_bug_match(query, b)` — a throwaway inline function;
+  `b` is just a placeholder name, refilled with a different real bug
+  dict on each of the 5 calls executor.map makes.
+  zip(bugs, verifications) pairs up bug[0]<->verification[0],
+  bug[1]<->verification[1] etc (guaranteed aligned since verifications
+  was built by running verify_bug_match on bugs in that exact order),
+  then b["verification"] = v staples each result onto its matching bug.
+RETURN: exactly k (5) bug dicts, each with bug_id/document/metadata/
+  similarity/verification.
+
+CITATION HANDLING — _CITATION_RE, normalize_citations, strip_ungrounded_citations
+-------------------------------------------------------------------------------------
+WHY CITATIONS MATTER: they're the AI "showing its work" — [SCRUM-9] lets
+a user verify exactly which real ticket backs up a claim, and becomes a
+clickable Jira link. The danger: an AI can INVENT a citation that looks
+exactly as credible as a real one (confirmed historically in this
+project — the AI once copied a placeholder example ID [BUG-1234] from
+its own prompt instructions and invented several more in that shape).
+
+- _CITATION_RE = regex pattern matching [PROJECT-123]-shaped text.
+  Deliberately generic on the project prefix (works for SCRUM-, BUG-,
+  any real Jira project) rather than hardcoding one prefix.
+- normalize_citations(text, allowed_ids): if the AI writes a REAL id
+  bare (no brackets, e.g. "BUG-2001" instead of "[BUG-2001]" — happened
+  live once when the placeholder example got removed from the prompt to
+  fix the hallucination, which fixed the fake-ID problem but cost the
+  bracket FORMAT), this function finds bare occurrences and adds
+  brackets. Processes LONGEST ids first (so "BUG-10" can't accidentally
+  match as a prefix inside "BUG-1002").
+- strip_ungrounded_citations(text, allowed_ids): finds every [XXX-###]
+  citation; if the ID IS in allowed_ids, keeps it unchanged; if NOT
+  (fabricated), DELETES it from the text entirely and remembers it in a
+  `removed` list. Followed by whitespace/punctuation cleanup (collapsing
+  double-spaces, removing space-before-punctuation, collapsing excess
+  blank lines) — though the cleanup is COSMETIC only; a sentence with a
+  citation removed can still read slightly awkwardly grammatically (e.g.
+  "confirmed by and." if two citations both got removed) — accepted
+  trade-off since catching a dangerous fabrication matters more than
+  perfect grammar in that rare case.
+- WHY BOTH THE PROMPT INSTRUCTION *AND* THIS CODE-LEVEL CHECK, WHEN THE
+  PROMPT ALREADY SAYS "NEVER INVENT AN ID": because AI instruction-
+  following is a strong tendency, NOT a hard guarantee, unlike normal
+  deterministic code (if x==5 is always exactly true or false; an AI
+  told a rule can still occasionally violate it, as historically proven
+  in this exact project). The prompt REDUCES how often mistakes happen;
+  the code guardrail GUARANTEES the mistake never reaches the screen even
+  when the AI doesn't cooperate. Analogy: telling an employee "always
+  double check your work" helps, but for high-stakes output you ALSO add
+  an automated/second-reviewer check regardless.
+
+GUARDRAILS — catching the AI contradicting itself
+------------------------------------------------------
+Important distinction: guardrails do NOT replace the AI's judgment — the
+AI still does all the actual semantic reasoning (is this relevant, why,
+what's the root cause). Guardrails only catch INCONSISTENCIES in how that
+judgment got expressed across two separate fields the AI fills in
+independently.
+
+1. _guard_duplicate_label(result, similarity)
+   - Problem: AI sometimes labels something "duplicate" while its own
+     `reasoning` text hedges with "related to"/"similar to"/"same
+     component" language — a real contradiction (duplicate should mean
+     "same root cause," not just "same general area").
+   - Only fires if: (a) suggested_action IS "duplicate", AND (b)
+     similarity is BELOW 0.75 (_DUPLICATE_GUARDRAIL_SIMILARITY_FLOOR).
+     Above 0.75, a high similarity score is itself strong independent
+     evidence the "duplicate" label is genuinely correct, so hedge-
+     sounding language there is treated as normal phrasing, not a real
+     red flag — don't second-guess high-confidence matches.
+   - If both conditions hold AND the reasoning text contains any hedge
+     phrase (_DUPLICATE_HEDGE_PHRASES list): downgrades
+     suggested_action from "duplicate" to "related".
+   - CONFIRMED LIVE: fired on SCRUM-56 for a refund query (similarity
+     0.73, reasoning said "related to refunds"/"same component") —
+     correctly downgraded duplicate -> related.
+
+2. _guard_relevance_consistency(result)
+   - Problem: is_relevant (bool) and suggested_action (badge) are filled
+     in independently and can disagree — e.g. is_relevant=False but
+     badge says "related", which looks visibly broken in the UI
+     (synthesize() filters by is_relevant, but app.py's badges render
+     suggested_action — so text could say "nothing found" directly above
+     a badge saying "related").
+   - Two directions, but BOTH converge to the SAME outcome: whichever
+     field signals "NOT relevant" wins and overrides the other — never
+     the reverse. (is_relevant=False + action=duplicate/related -> force
+     action to not_relevant; is_relevant=True + action=not_relevant ->
+     force is_relevant to False.) This is a DELIBERATE conservative bias:
+     a wrongly-EXCLUDED bug is a minor, recoverable inconvenience (user
+     can still see it in the source list, or rephrase); a wrongly-
+     INCLUDED bug pollutes the actual generated answer with a confident-
+     looking but wrong claim — a worse failure. Matches the system
+     prompt's own instruction to verify_bug_match to watch for "false-
+     friend" matches (already conservatively worded).
+   - CONFIRMED LIVE: fired multiple times across test runs (e.g. SCRUM-57
+     and SCRUM-11 in different queries, both is_relevant=False but
+     action='related' -> forced to not_relevant).
+
+VERIFY_BUG_MATCH(query, bug) — the actual AI judgment call
+---------------------------------------------------------------
+Runs ONCE PER retrieved bug (5 times per search, by default), CONCURRENTLY
+via retrieve()'s ThreadPoolExecutor.
+1. Builds bug_summary: a clean text block with ID/title/component/full
+   document, so the AI has everything it needs to judge relevance.
+2. system_prompt: explicit rules distinguishing "duplicate" (same root
+   cause) vs "related" (same feature/component, different specific
+   issue — e.g. styling vs behavior) vs "not_relevant" (different feature
+   entirely, even with keyword overlap) — with a concrete example baked
+   in ("tyre search popup" is NOT the same as "Save vehicle popup" even
+   though both are "popups").
+3. verification_schema: a JSON Schema passed to Ollama's structured-
+   output feature (`format=` param) — FORCES the AI's response into
+   exactly 4 fields (is_relevant/confidence/reasoning/suggested_action),
+   each type/enum-restricted. Without this, the AI would respond in free
+   prose, which is much harder for code to reliably parse and act on.
+4. The actual call: system_prompt + a user message combining the
+   question and bug_summary, temperature=0.0 (want max consistency for
+   a classification decision, not creative writing).
+5. On success: json.loads() the AI's text response into a real Python
+   dict, then run BOTH guardrails (_guard_duplicate_label, then
+   _guard_relevance_consistency) before returning.
+6. On failure (try/except Exception): local models/servers can fail for
+   many reasons (bad JSON, Ollama down, timeout, schema mismatch). Print
+   the real error for debugging, and return a SAFE FALLBACK dict shaped
+   like a normal result but with "error": True explicitly set. CRITICAL
+   DETAIL: without that error flag, a failed call would look EXACTLY
+   like a genuine "not relevant" judgment on screen — the flag exists
+   specifically so downstream code/checks can tell "the AI never actually
+   looked at this" apart from "the AI looked and said no."
+
+SYNTHESIZE(query, bugs) — writing the final answer
+-------------------------------------------------------
+1. If bugs list is completely empty: return an honest "found nothing"
+   message immediately, no AI call.
+2. grounded_bugs = filter bugs to only those where
+   verification.is_relevant is True (or missing entirely, defaulting to
+   True, for callers that skip verification). CONFIRMED LIVE: out of 5
+   retrieved bugs for one query, 1 (SCRUM-11) got excluded here for
+   being is_relevant=False, leaving 4 grounded_bugs.
+3. If grounded_bugs ends up empty (verification rejected EVERYTHING):
+   return the specific "found some bugs by similarity but none
+   substantively relevant" message — this is the exact message shown for
+   negative-case queries like the Bluetooth one.
+4. Build `context`: one labeled text block per grounded bug ("--- Bug 1
+   (ID: SCRUM-8, Status: Done) ---\n<full document>"), numbered starting
+   at 1 (not 0) purely for human/AI readability, joined with blank lines
+   between blocks.
+5. The actual AI call: a DIFFERENT system prompt from verification's —
+   this one focuses on HOW TO WRITE the answer: cite bracketed IDs
+   exactly as given, never invent an ID, if referencing "both"/"these
+   two" must actually cite that many distinct IDs, always explain root
+   cause + fix + affected component, never give a bare citation with no
+   explanation, be concise but complete. temperature=0.2 (slightly higher
+   than verification's 0.0 — some natural phrasing variation is fine
+   here since this is prose generation, not classification).
+6. Post-processing: grounded_ids = just the IDs from grounded_bugs (the
+   "allowed" list). normalize_citations() runs FIRST (rescue correct-
+   but-unformatted citations by adding missing brackets), THEN
+   strip_ungrounded_citations() runs (delete anything still not in the
+   allowed list — catches genuine hallucinations). Order matters: rescue
+   real-but-malformed citations BEFORE checking for fakes, so a real ID
+   that just forgot its brackets doesn't get treated as suspicious.
+7. Return the final cleaned answer string — exactly what app.py displays
+   under "Answer."
+
+RELEASE READINESS SECTION (brief — the deterministic GO/NO-GO gate)
+------------------------------------------------------------------------
+KEY FACT: the actual GO/NO-GO DECISION is made by plain Python logic
+(BLOCKING_PRIORITIES check + _is_open() status check), NOT by the AI —
+the AI is ONLY used to WRITE the human-readable explanation of a decision
+that has already been made deterministically. This keeps the actual gate
+trustworthy/auditable even though the write-up itself is AI-generated.
+- BLOCKING_PRIORITIES = {"High", "Blocker", "Highest"} — a bug blocks
+  release if its priority is any of these AND it's not closed. FIXED
+  BUG: originally missing "Highest" (Jira's real name for Blocker-
+  priority via the PRIORITY_MAP in jira_fetch.py/upload script), which
+  silently under-counted blocking bugs.
+- CLOSED_STATUSES = {"Closed", "Done", "Resolved"} — different Jira
+  project types use different words for "this is finished." FIXED BUG:
+  originally only checked for "Closed" exactly, missing "Done" (this
+  project's actual team-managed workflow status), causing EVERY release
+  to incorrectly show as NO-GO regardless of actual bug status.
+- get_bugs_for_release(): a STRUCTURED metadata filter (where=
+  {"release_version": ...}), NOT a semantic/similarity search — a go/
+  no-go gate needs the COMPLETE, exact set of bugs for a release, not
+  "bugs that happen to be similar to some query text."
+- _group_by_status(): pre-groups blocking bugs by their real status
+  before handing them to the AI for the write-up — prevents the AI from
+  incorrectly recombining/describing bugs from different statuses
+  identically (e.g. describing a still-"Open" bug the same way as a
+  "Ready for Test" bug, which are very different states of progress).
+- _clean_recommendation_text(): strips AI preamble artifacts ("Here is a
+  recommendation:"), wrapping quote marks, and — a REAL bug caught live
+  — comment-style scaffolding lines (// ...) and unfilled placeholder
+  text (e.g. "[list of bug descriptions]") that the AI once emitted
+  literally instead of real content, which had passed every other check
+  and shipped to the screen under a green GO badge before this fix.
+- _synthesize_release_recommendation(): TWO SEPARATE, branch-specific
+  system prompts for GO vs NO-GO (deliberately NOT one shared prompt) —
+  a single shared prompt saying "cite bug IDs like [X]" directly
+  contradicted the GO branch's "state NO ids yourself," and a local
+  model resolved that contradiction by literally copying the placeholder
+  example ID from its own instructions. Also NEVER lets the AI compute
+  its own bug-count/priority-breakdown arithmetic for the GO write-up —
+  a real run once swapped "3 low/4 medium" into "4 low/3 medium" while
+  ALSO dropping a bug ID, presented with full confidence and no visible
+  error — so that summary is built in deterministic Python instead
+  (by_priority dict + priority_order list) and appended after the AI's
+  one sentence.
+- check_release_readiness(release_version): the actual public function —
+  fetches all bugs for the version, computes blocking_bugs via the
+  deterministic rule, decision = "NO-GO" if any blocking bugs exist else
+  "GO", then calls the AI write-up function. Returns a dict with
+  decision/blocking_bugs/all_bugs/recommendation — this dict is exactly
+  what app.py's Release Readiness tab and bugwhisperer_mcp.py's
+  check_release tool both consume directly.
+
+ASK() — the one-line convenience wrapper
+---------------------------------------------
+def ask(query, k=5):
+    bugs = retrieve(query, k=k, verify=True)
+    answer = synthesize(query, bugs)
+    return answer, bugs
+- Combines retrieve+synthesize into one call. Used by
+  bugwhisperer_mcp.py and tests/run_regression_suite.py.
+- NOTE: app.py does NOT use ask() — it calls retrieve() and synthesize()
+  SEPARATELY, itself, achieving the exact same result. Two equivalent
+  paths to the same two-step sequence; app.py just happens to use the
+  unwrapped version, likely because it wants the two separate spinner
+  messages ("Searching..." then "Asking {model} to synthesize...")
+  shown to the user between the two steps.
+
+THE ONE-SENTENCE SUMMARY FOR AN INTERVIEW
+-----------------------------------------------
+"Every query goes through hybrid search — combining vector similarity and
+BM25 keyword matching — then each candidate bug is independently verified
+by a separate AI call before being trusted; several small guardrails
+catch the AI contradicting itself or inventing citations; and the release
+go/no-go decision is made by deterministic Python code, with the AI only
+writing the explanation of a decision it didn't make."
+
+KEY DESIGN PRINCIPLE RUNNING THROUGH THE WHOLE FILE
+---------------------------------------------------------
+The AI does all genuine semantic REASONING (is this relevant? why? what
+broke and how was it fixed?) — code cannot replace that. But the AI's
+raw output is NOT perfectly reliable at staying INTERNALLY CONSISTENT or
+accurate at simple arithmetic/formatting — so a thin layer of
+deterministic Python guardrails sits around it, catching specific, KNOWN
+failure patterns (contradictory labels, fabricated citations, wrong bug
+counts, scaffolding artifacts) discovered through actual testing, not
+speculative "just in case" coding. Every guardrail in this file exists
+because of a REAL failure observed during development, not a theoretical
+worry.
+
+
+
+
+================================================================================
+FILE 4: app.py
+================================================================================
+
+PURPOSE
+-------
+Streamlit UI. Two tabs: "Search bug history" and "Release readiness".
+Pure UI/wiring layer — calls into search.py for all actual logic, does
+no retrieval/verification/synthesis work itself.
+
+COMMAND
+-------
+streamlit run app.py  → opens http://localhost:8501
+
+STRUCTURE
+---------
+- Page setup: title "🔍 BugLens", page icon, wide layout.
+- Sidebar: a slider for k (how many bugs to retrieve, 3-15, default 5),
+  a "show raw retrieved text" checkbox, static info about which
+  LLM/embedding model/vector store is in use, and example questions.
+- Two helper functions translate internal AI-facing values into
+  display-friendly badges:
+    verification_badge(v): duplicate->"🟢 Match", related->"🟡 Related",
+    not_relevant->"🔴 Not relevant", error->"⚠️ Verification failed
+    (not a real judgment)" (explicitly distinct wording so a failed AI
+    call is never confused with a genuine "not relevant" verdict on
+    screen — same distinction search.py's verify_bug_match() error
+    handling was built to preserve).
+    decision_badge(decision): GO->"✅ GO", NO-GO->"🛑 NO-GO".
+  NOTE: internal code names stay "duplicate"/"related"/"not_relevant"
+  in search.py's schema and guardrails — only the DISPLAYED label was
+  ever renamed to friendlier wording ("Match" instead of "duplicate").
+  Confirmed via live testing this is sufficient — the confusing internal
+  word never actually reaches the user-facing screen.
+
+SEARCH TAB
+----------
+- st.text_input for the question.
+- On submit: bugs = retrieve(query, k=k, verify=True), then
+  answer = synthesize(query, bugs) — called as TWO SEPARATE steps
+  (does NOT use search.py's ask() convenience wrapper, even though
+  ask() does the exact same two calls internally) — likely so two
+  distinct spinner messages can show between them ("Searching bug
+  history..." then "Asking {model} to synthesize...").
+- Displays the answer, then all source bugs as expandable cards, SORTED
+  so verified-relevant bugs float to the top regardless of raw
+  similarity score (sort key: NOT is_relevant first, then -similarity —
+  i.e. relevant bugs always rank above not-relevant ones, and within
+  each group, highest similarity first).
+- Each card shows Component/Severity/Status/JIRA-link in four columns,
+  the verification reasoning + confidence, the Resolution text, and
+  (if the "show raw" checkbox is on) the full raw embedded document.
+
+RELEASE READINESS TAB
+----------------------
+- Explains the fixed rule in plain text before showing anything (NO-GO
+  if a bug tagged to this release is open AND High/Blocker priority) —
+  explicitly tells the user the decision itself is NOT a model guess.
+- Dropdown of all release versions (from list_release_versions()),
+  defaulting to the LAST one in the list (index=len(versions)-1) —
+  i.e. defaults to showing the newest/most recent release.
+- On "Check readiness" click: calls check_release_readiness(), shows
+  the decision badge + AI-written recommendation text.
+- Splits all_bugs into open_bugs / closed_bugs using search.py's OWN
+  _is_open() function (imported directly), rather than re-implementing
+  a separate status check locally — see FILE 4 fix note above (this
+  guarantees the UI table and the actual gate decision can never
+  silently disagree about what counts as "open").
+- Open bugs table has a "Blocking" column marking 🚫 Yes for any bug
+  ID present in result["blocking_bugs"] — lets a user see AT A GLANCE
+  which specific open bugs are the ones actually causing NO-GO, versus
+  open-but-lower-priority bugs that aren't blocking anything.
+- Closed/resolved bugs shown in a collapsed expander below (out of the
+  way by default, since they're not actionable for a go/no-go decision).
+- Both tables use st.column_config.LinkColumn to make the bug ID column
+  itself clickable, opening the real Jira ticket directly.
+
+QUICK SUMMARY — app.py
+------------------------
+Thin UI layer over search.py. Two tabs, each mapping directly to one
+search.py function (retrieve+synthesize for search; check_release_
+readiness for release gate). No business logic lives here — every
+actual decision (relevance, GO/NO-GO, what's blocking) is computed in
+search.py and simply DISPLAYED here. The one thing worth remembering:
+app.py explicitly reuses search.py's _is_open() rather than duplicating
+that check, specifically to prevent the UI and the gate from ever
+silently disagreeing about which bugs count as "open."
+
+
+================================================================================
+FILE 5: bugLens_mcp.py (MCP server)
+================================================================================
+
+PURPOSE
+-------
+Exposes search.py's functionality as three MCP tools any MCP-compatible
+AI assistant (GitHub Copilot, Claude Desktop, Cursor, etc.) can call
+directly from inside an editor/chat, without going through Streamlit.
+MCP runs over stdio — the host app (VS Code, etc.) launches this file as
+a subprocess and talks to it via standard input/output, not a network
+port.
+
+SETUP / COMMANDS
+-----------------
+pip install "mcp[cli]"
+mcp dev bugLens_mcp.py                    → test in MCP Inspector (browser)
+mcp install bugLens_mcp.py                → install into Claude Desktop
+.vscode/mcp.json config                   → wires it into VS Code Copilot Chat
+
+THE THREE TOOLS
+-----------------
+All three are thin wrappers — they call straight into search.py functions
+(no duplicate logic) and format the result as markdown text for the AI
+assistant to relay/re-summarize in its own chat UI.
+
+1. search_bugs(query, num_results=5) -> str
+   - k = clamped between 1 and 10 (max(1, min(10, num_results))) —
+     protects against an AI assistant passing something silly like 0 or
+     500 as num_results.
+   - Calls ask(query, k=k) — search.py's one-line retrieve+synthesize
+     wrapper (unlike app.py, this file DOES use ask() rather than
+     calling the two steps separately — makes sense here since there's
+     no need for two separate UI spinner messages in a text-only tool
+     response).
+   - Formats the answer + a per-bug list with a ✅/❌ relevance marker,
+     similarity score, action/confidence, a clickable JIRA link, and
+     the verification reasoning (only shown for relevant bugs).
+
+2. check_release(version) -> str
+   - First validates the version string against list_release_versions()
+     — if not found, returns available versions instead of erroring, so
+     the AI assistant can self-correct and retry with a valid one.
+   - Calls check_release_readiness(version) — same deterministic gate
+     app.py uses.
+   - Lists blocking bugs (if NO-GO) and all open bugs, each with a
+     clickable Jira link, plus a final total/open/resolved count line.
+
+3. list_releases() -> str
+   - Just calls list_release_versions() and formats as a bullet list —
+     exists so an AI assistant can discover valid version strings before
+     calling check_release, without the user needing to already know them.
+
+CONFIRMED LIVE BEHAVIOR (from actual testing in VS Code Copilot Chat)
+--------------------------------------------------------------------------
+- All three tools work end-to-end through the real MCP protocol — proven
+  via MCP Inspector AND live Copilot Chat sessions.
+- IMPORTANT CAVEAT: an AI assistant calling these tools does NOT
+  necessarily pass your exact typed words as the query — Copilot was
+  observed REPHRASING queries before calling search_bugs (e.g. "checkout
+  broken for European customers" became "issue similar to checkout
+  broken for European customers"), which changed the embedding and
+  caused a DIFFERENT (weaker) retrieval result than typing the same
+  question directly into Streamlit. This is a real, observed limitation
+  of the MCP path specifically — you don't control what text actually
+  reaches search.py's retrieve() when going through an AI assistant
+  intermediary, unlike the Streamlit UI where the user's exact words are
+  used unmodified.
+- Also observed: when the MCP tool itself failed (Ollama not running at
+  the time VS Code launched the MCP subprocess), Copilot detected the
+  failure, read the actual search.py source code on disk, started
+  `ollama serve` itself, and ran the retrieval logic directly as a
+  fallback — producing a correct result even when the primary MCP path
+  broke. Worth mentioning as a demo-worthy moment showing how an AI
+  assistant can self-heal around a broken tool integration, though NOT
+  something to rely on for a live demo (better to just ensure Ollama is
+  already running beforehand).
+
+QUICK SUMMARY — bugLens_mcp.py
+---------------------------------
+Same engine as app.py (search.py), different front door — lets AI coding
+assistants call search/release-check tools directly instead of using the
+Streamlit UI. All three tools are thin formatting wrappers around
+existing search.py functions; no new logic. Main practical caveat: the
+calling AI assistant may alter the query text before it reaches
+retrieve(), which can produce different results than the same words
+typed directly into Streamlit.
+
+
+
+"We have two layers of tests — pure logic tests that run instantly with no AI calls, checking our guardrails and our answer-quality scoring, and a live regression suite that runs real questions against the live system and grades the output. All of it passes right now, and every test case is built from a real failure we actually caught during development, not a hypothetical."
