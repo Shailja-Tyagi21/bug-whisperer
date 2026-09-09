@@ -87,24 +87,41 @@ search_tab, release_tab = st.tabs(["🔍 Search bug history", "🚦 Release read
 
 # ---- Search tab -------------------------------------------------------------
 with search_tab:
-    query = st.text_input(
-        "Your question:",
-        placeholder="e.g., have we seen checkout errors with PayPal?",
-    )
+    with st.form("search_form"):
+        query = st.text_input(
+            "Your question:",
+            placeholder="e.g., have we seen checkout errors with PayPal?",
+        )
+        submitted = st.form_submit_button("Search")
 
-    if query:
+    # Only run the pipeline when the button was actually pressed, not on
+    # every rerun. Streamlit reruns the whole script top-to-bottom on any
+    # interaction -- including switching to the Release Readiness tab --
+    # and a plain st.text_input keeps its value across that rerun, so an
+    # unguarded `if query:` was silently re-running the full
+    # search+verify+synthesize pipeline every time the Release Readiness
+    # tab was clicked, not just when a search was actually submitted.
+    # Wrapping the input in a form means it only fires on an explicit
+    # button press.
+    if submitted and query:
+        st.session_state["last_query"] = query
         with st.spinner("Searching bug history..."):
-            bugs = retrieve(query, k=k, verify=True)
-
+            st.session_state["last_bugs"] = retrieve(query, k=k, verify=True)
         with st.spinner(f"Asking {LLM_MODEL} to synthesize..."):
-            answer = synthesize(query, bugs)
+            st.session_state["last_answer"] = synthesize(
+                query, st.session_state["last_bugs"]
+            )
 
-        # ---- Answer ----------------------------------------------------------
+    # Render the most recent result, if any. This persists across reruns
+    # (tab switches, slider tweaks elsewhere on the page) without
+    # recomputing anything, since the result lives in session_state
+    # rather than being recalculated every time this block runs.
+    if "last_answer" in st.session_state:
         st.markdown("### Answer")
-        st.markdown(answer)
+        st.markdown(st.session_state["last_answer"])
 
-        # ---- Sources -----------------------------------------------------------
         st.markdown("### Source Bugs")
+        bugs = st.session_state["last_bugs"]
         if not bugs:
             st.info("No matching bugs found.")
         else:
@@ -145,7 +162,7 @@ with search_tab:
                     if show_raw:
                         st.code(b["document"])
     else:
-        st.info("Type a question above to get started.")
+        st.info("Type a question above and click Search to get started.")
 
 # ---- Release readiness tab --------------------------------------------------
 with release_tab:

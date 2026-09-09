@@ -5,4 +5,5 @@ __pycache__/
 *.pyo
 .DS_Store
 chroma_db/
+embedding_cache.json
 jira_bugs.csv

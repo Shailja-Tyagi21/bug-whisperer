@@ -58,9 +58,9 @@ MAX_BUGS = int(os.getenv("MAX_BUGS", "500"))
 # and Severity because the team-managed project has no native versions of
 # those fields exposed on the Bug work type. If you point this at a
 # different project, re-run list_jira_fields.py and update these.
-FIELD_ID_BUG_COMPONENT = "customfield_10076"
-FIELD_ID_RELEASE_VERSION = "customfield_10077"
-FIELD_ID_SEVERITY = "customfield_10078"
+FIELD_ID_BUG_COMPONENT = "customfield_10042"
+FIELD_ID_RELEASE_VERSION = "customfield_10044"
+FIELD_ID_SEVERITY = "customfield_10043"
 
 PAGE_SIZE = 50  # JIRA Cloud caps maxResults for /search/jql
 REQUEST_TIMEOUT = 30
