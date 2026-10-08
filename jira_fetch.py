@@ -8,9 +8,9 @@ This is the Jira-integration version -- it pulls the three CUSTOM DROPDOWN
 fields that this team-managed project uses in place of the missing native
 Components / Fix Version / Severity fields:
 
-    "Bug Component"   -> customfield_10076  -> CSV "Component"
-    "Release Version" -> customfield_10077  -> CSV "ReleaseVersion"
-    "Severity"        -> customfield_10078  -> CSV "Severity"
+    "Bug Component"   -> customfield_10042  -> CSV "Component"
+    "Release Version" -> customfield_10044  -> CSV "ReleaseVersion"
+    "Severity"        -> customfield_10043  -> CSV "Severity"
 
 The output CSV column names match sample_bugs.csv exactly, so ingest.py
 consumes it with no changes:

@@ -46,8 +46,8 @@ from search import (  # noqa: E402
 # "above" = must be treated as a genuine duplicate candidate
 # "below" = must be catchable by the guardrail as a same-component false match
 ANCHORS = [
-    ("PayPal redirect issue after checkout", "SCRUM-9", "above"),
-    ("Are there known issues with the tyre search popup?", "SCRUM-29", "below"),
+    ("PayPal redirect issue after checkout", "SCRUM-6", "above"),
+    ("Are there known issues with the tyre search popup?", "SCRUM-26", "below"),
 ]
 
 # How much clearance we want on either side of the floor. A value that only

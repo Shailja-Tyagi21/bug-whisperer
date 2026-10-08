@@ -409,8 +409,8 @@ def retrieve(query: str, k: int = 5, verify: bool = True) -> List[Dict]:
     """Return the top-k bugs using hybrid search (vector + BM25 keyword).
 
     How it works:
-    1. Vector search: embed the query, find the k*2 nearest bugs by cosine
-       similarity in ChromaDB (wider net than final k).
+    1. Vector search: embed the query, find the min(k*3, 15) nearest bugs by
+       cosine similarity in ChromaDB (wider net than final k).
     2. BM25 search: score ALL bugs by keyword overlap with the query.
     3. Merge: for each candidate, compute a weighted score:
          final = (1 - BM25_WEIGHT) * vector_score + BM25_WEIGHT * bm25_score
@@ -815,8 +815,9 @@ def _synthesize_release_recommendation(
 def check_release_readiness(release_version: str) -> Dict:
     """Deterministic go/no-go gate for a release version.
 
-    Rule: NO-GO if any bug tagged with this release is not Closed AND is
-    High or Blocker priority. Otherwise GO. Returns the decision, the list
+    Rule: NO-GO if any bug tagged with this release is open (status not in
+    CLOSED_STATUSES) AND has a priority in BLOCKING_PRIORITIES (High,
+    Highest, Blocker). Otherwise GO. Returns the decision, the list
     of blocking bugs (if any), and an LLM-written recommendation grounded
     in those facts.
     """

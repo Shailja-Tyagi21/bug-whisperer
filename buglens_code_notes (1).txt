@@ -38,6 +38,14 @@ CONFIG (read from .env)
     created instead. Jira's API refers to custom fields by these opaque
     IDs, not by display name. Found originally via list_jira_fields.py
     (GET /rest/api/3/field, filtered by name).
+  → UPDATE (after Jira migration): the values above are for the ORIGINAL
+    site (hackathon-team-michelin.atlassian.net). The new site
+    (hacakthoncg.atlassian.net, space "BugLens - SCRUM") uses DIFFERENT IDs:
+        Bug Component   = customfield_10042
+        Severity        = customfield_10043
+        Release Version = customfield_10044
+    jira_fetch.py was updated to use these. This is exactly the "field ID
+    drift" case the sanity check in main() is designed to catch.
 - PAGE_SIZE = 50   — Jira's own cap per API response
 - REQUEST_TIMEOUT = 30 seconds
 
@@ -90,7 +98,8 @@ KEY FUNCTIONS (in order of use)
           "Resolution:", split on it and keep ONLY the text after it as
           resolution_name.
        e. If "Resolution:" is NOT found in the comment, use the whole
-          comment as-is (nothing to split).
+          comment as-is (capped at its first 500 characters — the cap is
+          applied BEFORE the split).
 
      REAL BUG FOUND AND FIXED (post-Jira-integration): the original
      version only did step (d)'s split to PULL OUT the resolution text —
@@ -199,6 +208,9 @@ CONFIG
 - DEFAULT_CSV = "sample_bugs.csv" — fallback if no --csv flag given
 - EMBED_BATCH_SIZE = 50           — send bugs to Ollama in chunks of 50
                                     rather than all at once (memory/latency)
+- EMBED_CACHE_PATH = "./embedding_cache.json" — local on-disk cache of
+                                    already-computed vectors (see EMBEDDING
+                                    CACHE section under embed_batch below)
 
 KEY PATTERN: lazy singleton (get_ollama_client)
 -------------------------------------------------
@@ -257,6 +269,12 @@ KEY FUNCTIONS
      showing "Status: Done" on a card, or the release-readiness gate
      checking status/priority).
    - Every field forced to str(...) for consistent typing downstream.
+   - KNOWN GAP: only `resolution` is NaN-guarded (below). The other fields
+     (title, component, severity, priority, status, release_version,
+     created) use a bare str(...), so a blank CSV cell becomes the string
+     "nan" (e.g. a blank ReleaseVersion would appear as a "nan" release).
+     build_text_for_embedding() has the same gap for Title/Component/
+     Description. Not triggered on the current data.
    - resolution = "" if pd.isna(resolution) else str(resolution)
        - A conditional expression (one-line if/else). Unfolded:
              if pd.isna(resolution):
@@ -300,9 +318,11 @@ read many times)
   dictionary, read back out of ChromaDB unchanged.
 - app.py: meta.get('component'), meta.get('severity'), meta.get('status')
   — used to render the Source Bug cards.
-- app.py's release readiness tab: b["metadata"].get("status", "").lower()
-  not in ("done", "closed", "resolved") — the exact status-checking logic
-  that determines the GO/NO-GO gate.
+- search.py's _is_open(): bug["metadata"].get("status", "").strip() not in
+  CLOSED_STATUSES — the status-checking logic that determines the GO/NO-GO
+  gate. app.py reuses it directly. (bugLens_mcp.py does NOT: its
+  check_release re-implements the check as
+  status.lower() not in ("done", "closed", "resolved").)
 - Written ONCE per bug at ingest time; read MANY times afterward by every
   search and every release check, forever, until the next re-ingest.
 
@@ -321,26 +341,70 @@ read many times)
    - Wrapped in try/except ollama.ResponseError — fails fast with a clear
      "is ollama serve running / did you pull the model" message rather
      than a confusing raw stack trace.
-   - all_embeddings.extend(response.embeddings) — see APPEND VS EXTEND
-     note below. Ends with ONE FLAT list of 60 vectors total, in the same
-     order as the original 60 input texts, regardless of how many batches
-     it took to get there.
+   - New vectors are stored into the embedding cache by index (see
+     EMBEDDING CACHE below). embed_batch() returns ONE FLAT list of
+     vectors, [cache[h] for h in hashes], in the SAME order as the input
+     texts, however many batches ran.
 
-   APPEND VS EXTEND (small but important Python distinction):
-   -----------------------------------------------------------
-   my_list = [1, 2, 3]
-   new_items = [4, 5, 6]
+   EMBEDDING CACHE (added later — embed_batch() now checks it first)
+   -----------------------------------------------------------------
+   GOAL: re-running ingest.py should NOT re-embed bugs whose text hasn't
+   changed. Embedding is the slow step (a network call to local Ollama per
+   batch), and ingest is re-run whenever Jira data changes.
 
-   my_list.append(new_items)  → [1, 2, 3, [4, 5, 6]]     (nested — WRONG
-                                                            shape for this use)
-   my_list.extend(new_items)  → [1, 2, 3, 4, 5, 6]        (flat — what we want)
+   Three small pieces, all in ingest.py:
 
-   response.embeddings for one batch of 3 texts looks like:
-       [[v1_768_numbers], [v2_768_numbers], [v3_768_numbers]]
-   .extend() unpacks that and adds each vector individually into
-   all_embeddings, so after 2 batches you get ONE flat list of 60 vectors
-   — not a list of 2 batches. This exact flat shape is what
-   collection.add(embeddings=...) expects later.
+   a) _text_hash(text) — generates the LOOKUP KEY only (pure function, no
+      storage, no checking):
+          hashlib.sha256(f"{EMBEDDING_MODEL}::{text}".encode("utf-8")).hexdigest()
+      - Hashes the bug's full embedded text (title + component +
+        description + comments + resolution) into a fingerprint.
+      - The MODEL NAME is part of the hashed string on purpose: if
+        EMBEDDING_MODEL is ever swapped, every fingerprint changes, so the
+        cache can never silently return a vector computed by the WRONG
+        model (which would have the wrong dimension / meaning).
+      - Any edit to a bug's text (new comment, changed description)
+        changes its hash -> counts as "new" and gets re-embedded.
+
+   b) _load_embed_cache() / _save_embed_cache(cache) — read/write
+      embedding_cache.json, a dict of {hash: vector}.
+
+   c) embed_batch() — the actual caching logic, BEFORE any Ollama call:
+        cache = _load_embed_cache()
+        hashes = [_text_hash(t) for t in texts]
+        to_embed_idx = [i for i, h in enumerate(hashes) if h not in cache]
+      1. Hash every text.
+      2. Anything whose hash is already in the cache is reused as-is.
+      3. ONLY the texts whose hash is missing (new or changed bugs) are
+         sent to Ollama, in batches of EMBED_BATCH_SIZE.
+      4. New vectors are stored back into the cache (keyed by hash) and
+         the cache file is saved once at the end.
+      5. Returns [cache[h] for h in hashes] — so the output is still ONE
+         flat list of vectors in the SAME order as the input texts,
+         exactly the shape collection.add() expects, whether a vector came
+         from cache or from Ollama.
+
+   VERIFIED LIVE: after editing SCRUM-9's description in Jira, re-fetching
+   and re-running ingest printed:
+        Embedding cache: 59/60 unchanged, reusing cached vectors.
+        Embedding batch 1 (1 new/changed texts)...
+   i.e. 59 bugs came straight from cache, only the 1 edited bug got a
+   fresh embedding call.
+
+   ONE-LINE ANSWER IF ASKED: "Each bug's text is hashed, and that hash is
+   checked against a local cache file before calling Ollama — only bugs
+   that are new or genuinely changed get re-embedded; everything else
+   reuses its stored vector, and the model name is part of the hash so a
+   model change can never return a stale vector."
+
+   NOTE: the cache only skips the EMBEDDING step. The ChromaDB collection
+   is still fully rebuilt every run (see step [4/4]).
+
+   NOTE (history): an earlier version of embed_batch() built the flat list
+   with all_embeddings.extend(response.embeddings) (extend flattens; append
+   would nest a list per batch). The cached version no longer uses
+   all_embeddings, but the returned list is still flat, which is the shape
+   collection.add(embeddings=...) expects.
 
 4. main() — orchestrates everything in 4 numbered steps
    ------------------------------------------------------
@@ -391,11 +455,19 @@ read many times)
       - chromadb.PersistentClient(path=CHROMA_DIR) — "persistent" means
         saved to disk (the ./chroma_db folder), not just kept in memory
         and lost when the script ends.
-      - delete_collection() wrapped in try/except Exception: pass — makes
-        this script SAFELY RE-RUNNABLE. Deletes any old "bugs" collection
-        first so re-running doesn't pile up duplicate/stale data. The
-        try/except specifically handles "nothing exists yet to delete"
-        (e.g. very first run) without treating that as an error.
+      - _rebuild_chroma_dir() — ingest.py wipes the ENTIRE chroma_db
+        directory (shutil.rmtree) before recreating it, every run, so
+        re-running never piles up duplicate/stale data. It does NOT call
+        delete_collection() any more: that removed the collection's
+        metadata entry but the on-disk index segments weren't always fully
+        purged — ingest appeared to "succeed" while queries still returned
+        STALE bug IDs from a previous ingest (the only manual fix was
+        deleting the whole chroma_db folder).
+        CAVEAT: this can't fix a second cause of the same symptom —
+        concurrent access. If Streamlit (or anything else holding a
+        PersistentClient on the same directory) is still running while
+        ingest.py executes, two connections write to the same SQLite-backed
+        store. Always STOP Streamlit before running ingest.py.
       - create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
         TWO DIFFERENT "METADATA" CONCEPTS — don't confuse them:
           (a) PER-BUG metadata (build_metadata() output) — one small dict
@@ -467,9 +539,17 @@ QUICK SUMMARY — ingest.py
   rebuilding the whole database — it's a structural contract, not a
   personal setting.
 - Runs in 4 steps: load+validate CSV → health-check Ollama → build texts/
-  embeddings/metadata/ids → delete old collection and write the new one.
-- Deletes and recreates the ChromaDB collection every run, so it's safely
-  re-runnable any time the source data changes.
+  embeddings/metadata/ids → wipe chroma_db and write the new collection,
+  then verify collection.count() matches the CSV row count.
+- Rebuilds ChromaDB from scratch every run, so it's safely
+  re-runnable any time the source data changes. (It wipes the whole
+  chroma_db directory, since delete_collection() alone left stale
+  segments behind. Stop Streamlit before running ingest.)
+- `--no-cache` flag deletes embedding_cache.json first to force a full
+  re-embed.
+- Embedding cache (embedding_cache.json, keyed by SHA-256 of model name +
+  text): unchanged bugs reuse stored vectors; only new/edited bugs are sent
+  to Ollama. Verified: 59/60 reused after editing one bug.
 - Explicitly pins the distance metric to "cosine" at creation time — this
   was the fix for a real past bug where the metric silently defaulted to
   "l2," quietly breaking every similarity threshold in search.py.
@@ -491,7 +571,7 @@ asks the AI to write a final answer grounded ONLY in verified-relevant
 bugs. Also contains the deterministic release readiness (GO/NO-GO) logic.
 
 NEVER RUN DIRECTLY IN PRODUCTION — imported as a library by app.py and
-bugwhisperer_mcp.py. Can be run standalone for quick terminal testing:
+bugLens_mcp.py. Can be run standalone for quick terminal testing:
     python3 search.py "some question"
 
 CONFIG
@@ -554,7 +634,7 @@ list_all_bug_ids() -> set
 - Fetches every bug ID in the collection (include=[] skips
   documents/embeddings/metadata for speed — only IDs needed).
 - Returned as a SET (not list) for fast "is this ID real?" membership
-  checks — used by quality_checks.py to catch fabricated citations.
+  checks — used by tests/run_regression_suite.py to catch fabricated citations.
 
 HYBRID SEARCH (BM25 + vector) — THE MOST IMPORTANT DESIGN DECISION HERE
 --------------------------------------------------------------------------
@@ -808,7 +888,7 @@ trustworthy/auditable even though the write-up itself is AI-generated.
 - BLOCKING_PRIORITIES = {"High", "Blocker", "Highest"} — a bug blocks
   release if its priority is any of these AND it's not closed. FIXED
   BUG: originally missing "Highest" (Jira's real name for Blocker-
-  priority via the PRIORITY_MAP in jira_fetch.py/upload script), which
+  priority in the Jira data), which
   silently under-counted blocking bugs.
 - CLOSED_STATUSES = {"Closed", "Done", "Resolved"} — different Jira
   project types use different words for "this is finished." FIXED BUG:
@@ -847,7 +927,7 @@ trustworthy/auditable even though the write-up itself is AI-generated.
   deterministic rule, decision = "NO-GO" if any blocking bugs exist else
   "GO", then calls the AI write-up function. Returns a dict with
   decision/blocking_bugs/all_bugs/recommendation — this dict is exactly
-  what app.py's Release Readiness tab and bugwhisperer_mcp.py's
+  what app.py's Release Readiness tab and bugLens_mcp.py's
   check_release tool both consume directly.
 
 ASK() — the one-line convenience wrapper
@@ -857,7 +937,7 @@ def ask(query, k=5):
     answer = synthesize(query, bugs)
     return answer, bugs
 - Combines retrieve+synthesize into one call. Used by
-  bugwhisperer_mcp.py and tests/run_regression_suite.py.
+  bugLens_mcp.py and tests/run_regression_suite.py.
 - NOTE: app.py does NOT use ask() — it calls retrieve() and synthesize()
   SEPARATELY, itself, achieving the exact same result. Two equivalent
   paths to the same two-step sequence; app.py just happens to use the
@@ -945,17 +1025,20 @@ SEARCH TAB
 
 RELEASE READINESS TAB
 ----------------------
-- Explains the fixed rule in plain text before showing anything (NO-GO
-  if a bug tagged to this release is open AND High/Blocker priority) —
+- Explains the fixed rule in plain text before showing anything (the UI
+  text says NO-GO if a bug is open ("not Closed") AND High or Blocker
+  priority — slightly narrower than the real rule in search.py, which
+  also counts Highest priority and treats Done/Resolved as closed) —
   explicitly tells the user the decision itself is NOT a model guess.
 - Dropdown of all release versions (from list_release_versions()),
-  defaulting to the LAST one in the list (index=len(versions)-1) —
-  i.e. defaults to showing the newest/most recent release.
+  defaulting to the LAST one in the list (index=len(versions)-1). The list
+  is sorted as plain strings, so this is the newest release only for
+  same-width version numbers (v2.10.0 sorts before v2.9.0).
 - On "Check readiness" click: calls check_release_readiness(), shows
   the decision badge + AI-written recommendation text.
 - Splits all_bugs into open_bugs / closed_bugs using search.py's OWN
   _is_open() function (imported directly), rather than re-implementing
-  a separate status check locally — see FILE 4 fix note above (this
+  a separate status check locally (this
   guarantees the UI table and the actual gate decision can never
   silently disagree about what counts as "open").
 - Open bugs table has a "Blocking" column marking 🚫 Yes for any bug
@@ -1026,6 +1109,9 @@ assistant to relay/re-summarize in its own chat UI.
      app.py uses.
    - Lists blocking bugs (if NO-GO) and all open bugs, each with a
      clickable Jira link, plus a final total/open/resolved count line.
+   - NOTE: "open" here is computed locally with status.lower() not in
+     ("done", "closed", "resolved"), NOT via search.py's _is_open() as
+     app.py does — two definitions that could drift apart.
 
 3. list_releases() -> str
    - Just calls list_release_versions() and formats as a bullet list —

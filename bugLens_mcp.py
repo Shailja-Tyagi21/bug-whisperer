@@ -26,12 +26,12 @@ INSTALL INTO CLAUDE DESKTOP:
 
 CONFIGURE IN VS CODE (settings.json or .vscode/mcp.json):
     {
-      "mcpServers": {
+      "servers": {
         "buglens": {
           "command": "python3",
           "args": ["<full-path-to>/bugLens_mcp.py"],
           "env": {
-            "JIRA_URL": "https://hackathon-team-michelin.atlassian.net"
+            "JIRA_URL": "https://hacakthoncg.atlassian.net"
           }
         }
       }
@@ -113,8 +113,8 @@ def check_release(version: str) -> str:
     """Check whether a release version is ready to ship.
 
     Returns GO or NO-GO based on a deterministic rule: NO-GO if any bug
-    tagged with this release version is still open AND has High or Blocker
-    priority. The decision is made in Python, not by the LLM — the LLM
+    tagged with this release version is still open AND has High, Highest
+    or Blocker priority. The decision is made in Python, not by the LLM — the LLM
     only writes the explanation.
 
     Args:

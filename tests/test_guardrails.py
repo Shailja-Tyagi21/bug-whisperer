@@ -10,8 +10,6 @@ been caught immediately by tests like these instead of by re-clicking
 through the UI.
 
 Run:
-    cd bugbrain
-    python3 -m pytest tests/test_guardrails.py -v
     # or, with no pytest installed:
     python3 tests/test_guardrails.py
 """
