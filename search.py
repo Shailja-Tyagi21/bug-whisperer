@@ -16,6 +16,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import List, Dict, Tuple
 
 import chromadb
@@ -58,6 +59,48 @@ JIRA_BASE_URL = os.getenv(
 _ollama_client = None
 _collection = None
 
+# Marker of the ingest run the cached collection / BM25 index were loaded from.
+# ingest.py wipes and recreates the whole chroma_db directory on every run, so a
+# long-lived process (Streamlit, the MCP server) would otherwise keep serving
+# the OLD collection handle and OLD BM25 index until restarted.
+_index_stamp = None
+
+
+INGEST_STAMP_FILE = ".ingest_stamp"   # written by ingest.py after each successful run
+
+
+def _chroma_stamp():
+    """Fingerprint of the last completed ingest: the contents of a small marker
+    file that ingest.py writes inside chroma_db after every successful run.
+    (Chroma's own files change on plain reads, so they make a poor signal.)
+    Returns None if the marker doesn't exist, e.g. a collection built by an
+    older ingest.py -- in which case no automatic reload happens."""
+    try:
+        return (Path(CHROMA_DIR) / INGEST_STAMP_FILE).read_text().strip()
+    except OSError:
+        return None
+
+
+def _reset_if_reingested() -> None:
+    """Drop the cached collection + BM25 index if a newer ingest has completed
+    since they were loaded, so the next access reloads fresh data."""
+    global _collection, _bm25_index, _bm25_ids, _bm25_docs, _index_stamp
+    stamp = _chroma_stamp()
+    have_cached = _collection is not None or _bm25_index is not None
+    if have_cached and stamp != _index_stamp:
+        print("  [search] chroma_db changed on disk (re-ingest?) -- "
+              "reloading collection and BM25 index")
+        _collection = None
+        _bm25_index = _bm25_ids = _bm25_docs = None
+        # chromadb caches client "systems" per path; clear it so a recreated
+        # directory isn't served from a stale handle.
+        try:
+            from chromadb.api.client import SharedSystemClient
+            SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
+    _index_stamp = stamp
+
 
 def get_ollama_client() -> ollama.Client:
     global _ollama_client
@@ -68,6 +111,7 @@ def get_ollama_client() -> ollama.Client:
 
 def get_collection():
     global _collection
+    _reset_if_reingested()
     if _collection is None:
         client = chromadb.PersistentClient(path=CHROMA_DIR)
         _collection = client.get_collection(name=COLLECTION_NAME)
@@ -133,6 +177,7 @@ def _tokenize(text: str) -> List[str]:
 def get_bm25_index():
     """Lazy-build a BM25 index from all documents in the collection."""
     global _bm25_index, _bm25_ids, _bm25_docs
+    _reset_if_reingested()
     if _bm25_index is None:
         collection = get_collection()
         all_data = collection.get(include=["documents"])

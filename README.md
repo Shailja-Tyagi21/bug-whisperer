@@ -79,6 +79,8 @@ The interesting part of this build is the boundary between what the model decide
 
 The LLM writes the *explanation* for a go/no-go verdict it is handed. It never makes the verdict.
 
+**The release rule:** NO-GO if any bug tagged with the release is open (status not in `CLOSED_STATUSES` = Closed, Done, Resolved) **and** has a priority in `BLOCKING_PRIORITIES` (High, Highest, Blocker). Both constants live at the top of the release section in `search.py`.
+
 ---
 
 ## Setup (one-time, ~10 minutes)
@@ -250,6 +252,8 @@ python3 tests/check_similarity_calibration.py
 # 3. Full live regression run — needs Ollama + a built collection
 python3 tests/run_regression_suite.py
 ```
+
+> **Corpus note:** the two live scripts (`check_similarity_calibration.py`, `run_regression_suite.py`) are calibrated to the **Jira-ingested** corpus — `SCRUM-xx` ticket IDs and releases `v2.5.0` / `v2.6.0`. Against `sample_bugs.csv` (which uses `BUG-xxxx` IDs) they stop early with a message saying what's missing. The unit tests in layer 1 don't depend on either corpus.
 
 `check_similarity_calibration.py` covers a gap the unit tests structurally cannot: `test_guardrails.py` passes similarity values in by hand, so it keeps passing regardless of what the live stack actually produces. The calibration script measures real anchor cases — a genuine duplicate that must score above `_DUPLICATE_GUARDRAIL_SIMILARITY_FLOOR`, and a same-component false match that must score below it — and fails if the floor has stopped separating them.
 

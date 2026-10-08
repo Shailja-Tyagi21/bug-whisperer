@@ -14,6 +14,7 @@ import streamlit as st
 from search import (
     retrieve, synthesize, JIRA_BASE_URL, LLM_MODEL,
     list_release_versions, check_release_readiness, _is_open,
+    BLOCKING_PRIORITIES, CLOSED_STATUSES,
 )
 
 # ---- Page setup ------------------------------------------------------------
@@ -166,11 +167,16 @@ with search_tab:
 
 # ---- Release readiness tab --------------------------------------------------
 with release_tab:
+    # Built from the same constants the gate uses (search.py), so this text
+    # can't drift out of date when the rule changes.
+    blocking = ", ".join(sorted(BLOCKING_PRIORITIES))
+    closed = ", ".join(sorted(CLOSED_STATUSES))
     st.markdown(
         "Checks a release against a fixed rule: **NO-GO if any bug tagged "
-        "with this release is still open (not Closed) and is High or "
-        "Blocker priority.** The go/no-go call itself is a plain rule, not "
-        "a model guess — only the explanation below it is LLM-written."
+        f"with this release is still open (status not one of {closed}) and "
+        f"has priority {blocking}.** The go/no-go call itself is a plain "
+        "rule, not a model guess — only the explanation below it is "
+        "LLM-written."
     )
 
     versions = list_release_versions()

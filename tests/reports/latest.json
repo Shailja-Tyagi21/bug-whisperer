@@ -1,15 +1,15 @@
 {
-  "timestamp": "20260923_233840",
+  "timestamp": "20261008_170255",
   "results": {
     "PayPal redirect issue after checkout": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 29.1
+      "elapsed_s": 28.4
     },
     "checkout broken for European customers": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 25.7
+      "elapsed_s": 25.6
     },
     "has our refund process had any silent failures?": {
       "passed": true,
@@ -19,32 +19,32 @@
     "how did we fix the memory leak in the worker service?": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 26.3
+      "elapsed_s": 26.0
     },
     "what caused the database connection pool issue?": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 25.6
+      "elapsed_s": 25.5
     },
     "any performance issues with dashboards or reports loading slowly?": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 30.2
+      "elapsed_s": 30.1
     },
     "what MFA or login delivery issues have we seen?": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 30.5
+      "elapsed_s": 30.4
     },
     "Are there known issues with the tyre search popup?": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 21.8
+      "elapsed_s": 21.3
     },
     "do we have any Bluetooth pairing bugs?": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 19.1
+      "elapsed_s": 18.5
     },
     "has billing ever charged customers twice?": {
       "passed": true,
@@ -54,12 +54,12 @@
     "v2.5.0": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 4.8
+      "elapsed_s": 4.9
     },
     "v2.6.0": {
       "passed": true,
       "quality_errors": [],
-      "elapsed_s": 1.4
+      "elapsed_s": 1.5
     }
   }
 }

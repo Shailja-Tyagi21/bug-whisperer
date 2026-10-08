@@ -53,6 +53,7 @@ from search import (
     list_release_versions,
     list_all_bug_ids,
     JIRA_BASE_URL,
+    _is_open,
 )
 
 mcp = MCPServer("BugLens")
@@ -146,11 +147,9 @@ def check_release(version: str) -> str:
             parts.append(f"  JIRA: {jira_link}")
 
     all_bugs = result.get("all_bugs", [])
-    open_bugs = [
-        b for b in all_bugs
-        if b["metadata"].get("status", "").lower()
-        not in ("done", "closed", "resolved")
-    ]
+    # Same open/closed rule the go/no-go gate itself uses (search.py's
+    # _is_open / CLOSED_STATUSES), so this list can never disagree with it.
+    open_bugs = [b for b in all_bugs if _is_open(b)]
     if open_bugs:
         parts.append(f"\n**Open bugs in {version} ({len(open_bugs)}):**")
         for b in open_bugs:

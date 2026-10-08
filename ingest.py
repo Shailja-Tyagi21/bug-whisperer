@@ -17,6 +17,8 @@ import json
 import os
 import shutil
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -150,6 +152,18 @@ def embed_batch(client: ollama.Client, texts: list, batch_size: int = EMBED_BATC
                 idx = to_embed_idx[i + j]
                 cache[hashes[idx]] = emb
 
+    # Prune: keep only vectors for texts in THIS run. Without this, every edited
+    # bug leaves its old vector behind and the cache grows forever. (Trade-off:
+    # it is a "what the last ingest used" cache -- ingesting a different CSV,
+    # e.g. sample_bugs.csv, drops the other corpus's vectors, and editing a bug
+    # back to an older text re-embeds it once.)
+    live = set(hashes)
+    pruned = {h: v for h, v in cache.items() if h in live}
+    if to_embed_idx or len(pruned) != len(cache):
+        dropped = len(cache) - len(pruned)
+        if dropped:
+            print(f"      Embedding cache: pruned {dropped} orphaned vector(s).")
+        cache = pruned
         _save_embed_cache(cache)
 
     return [cache[h] for h in hashes]
@@ -262,6 +276,13 @@ def main():
     else:
         print(f"      Verified: collection now contains exactly "
               f"{stored_count} bugs, matching the CSV.")
+
+    # Tell long-running processes (Streamlit, the MCP server) that a new ingest
+    # finished, so search.py reloads its collection handle and BM25 index
+    # instead of serving the previous ingest's data until it is restarted.
+    (Path(CHROMA_DIR) / ".ingest_stamp").write_text(
+        f"{uuid.uuid4()} {datetime.now().isoformat()}"
+    )
 
     print(f"\nDone. Stored {len(ids)} bugs in collection '{COLLECTION_NAME}'.")
     print(f"Embedding dimension: {len(embeddings[0])}")

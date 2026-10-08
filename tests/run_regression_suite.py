@@ -31,7 +31,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from search import ask, check_release_readiness, list_all_bug_ids  # noqa: E402
+from search import (  # noqa: E402
+    ask, check_release_readiness, list_all_bug_ids, list_release_versions,
+)
 from quality_checks import (  # noqa: E402
     score_search_answer,
     score_release_recommendation,
@@ -147,7 +149,7 @@ def load_baseline() -> dict:
     if not BASELINE_PATH.exists():
         return {}
     try:
-        return json.loads(BASELINE_PATH.read_text())
+        return json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -172,6 +174,24 @@ def main():
     print("Loading corpus bug IDs...", end=" ", flush=True)
     known_ids = list_all_bug_ids()
     print(f"{len(known_ids)} bugs in collection.\n")
+
+    # The expected GO/NO-GO decisions and the question set were written against
+    # the Jira-ingested corpus (SCRUM-xx IDs). Fail early with a clear message
+    # if the collection was built from something else, instead of reporting
+    # confusing gate mismatches.
+    available = set(list_release_versions())
+    missing = [v for v, _ in RELEASE_CHECKS if v not in available]
+    if missing:
+        sys.exit(
+            f"Release version(s) {', '.join(missing)} not found in the collection "
+            f"(found: {', '.join(sorted(available)) or 'none'}).\n"
+            f"This suite is calibrated to the Jira-ingested corpus. Run "
+            f"jira_fetch.py + ingest.py first, or update RELEASE_CHECKS."
+        )
+    if not any(i.startswith("SCRUM-") for i in known_ids):
+        print("⚠️  Collection has no SCRUM-xx IDs (built from sample_bugs.csv?). "
+              "The suite will run, but results are not comparable with the "
+              "committed baseline in tests/reports/latest.json.\n")
 
     print(f"Running {len(SEARCH_QUERIES)} search queries + "
           f"{len(RELEASE_CHECKS)} release checks against the live stack...\n")
@@ -288,7 +308,7 @@ def main():
             lines.append(f"\n{f}")
         lines.append(f"\n> {r['recommendation']}\n")
 
-    report_path.write_text("\n".join(lines))
+    report_path.write_text("\n".join(lines), encoding="utf-8")
 
     # ---- write machine-readable baseline for the next run ----
     BASELINE_PATH.write_text(json.dumps({

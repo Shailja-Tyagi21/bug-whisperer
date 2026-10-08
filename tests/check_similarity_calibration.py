@@ -39,6 +39,7 @@ from search import (  # noqa: E402
     _DUPLICATE_GUARDRAIL_SIMILARITY_FLOOR as FLOOR,
     embed_query,
     get_distance_space,
+    list_all_bug_ids,
     retrieve,
 )
 
@@ -117,6 +118,19 @@ def main():
     print(f"\nCollection distance metric : {get_distance_space()!r}")
     print(f"Embedding model            : {search.EMBEDDING_MODEL}")
     print(f"Guardrail floor            : {FLOOR}\n")
+
+    # The anchors are specific tickets (SCRUM-xx) from the Jira-ingested corpus.
+    # sample_bugs.csv uses different IDs (BUG-xxxx), so fail early and clearly
+    # rather than reporting "not in top 10" for tickets that were never loaded.
+    known = list_all_bug_ids()
+    absent = [bug_id for _, bug_id, _ in ANCHORS if bug_id not in known]
+    if absent:
+        sys.exit(
+            f"Anchor ticket(s) {', '.join(absent)} are not in this collection.\n"
+            f"These anchors belong to the Jira-ingested corpus. Run "
+            f"jira_fetch.py + ingest.py first, or update ANCHORS in this file "
+            f"(and tests/test_guardrails.py) to tickets that exist here."
+        )
 
     print("Embedding normalization:")
     check_normalization()
